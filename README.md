@@ -266,6 +266,50 @@ Makefile         convenience wrapper
 build/           compiled binaries and .asm output (git-ignored)
 ```
 
+## How the compiler works
+
+`jive` is a classic three-stage pipeline: each stage turns the previous stage's output into something closer to machine code.
+
+```
+  source.jive   ──► lexer ──► tokens ──► parser ──► AST ──► codegen ──► out.asm
+  (text)                     (stream)              (tree)              (NASM)
+```
+
+**Lexer** ([code/lexer.c](code/lexer.c)). Scans the source character by character and groups characters into tokens — keywords, identifiers, numbers, strings, punctuation. Whitespace and `//` comments are dropped. Each token carries its `file:line:col` location so later stages can report errors that point back to the source.
+
+**Parser** ([code/parser.c](code/parser.c)). A recursive-descent parser that walks the token stream following the [Jive EBNF grammar](#grammar-ebnf) and builds an abstract syntax tree. Each grammar rule (`parse_program`, `parse_fn_def`, `parse_block`, `parse_statement`, `parse_expression`) consumes exactly the tokens its rule covers. Mismatches turn into `file:line:col: error: expected X, got Y` diagnostics. The AST is a tree of `AST_Node`s linked together with `AST_List` (head + tail + count, doubly linked).
+
+Dump the AST with `--dump-ast`:
+
+```
+$ ./build/jive jive_programs/simple.jive --dump-ast -o /dev/null
+=== ast ===
+program
+  fn main() -> int
+    return
+      integer 42
+```
+
+**Code generator** ([code/codegen.c](code/codegen.c)). Walks the AST top-down and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then visits each `fn` node to emit a label, walks the body, and emits `mov rax, <N>` + `ret` for each `return <int>` statement.
+
+The output for `fn main() -> int { return 42 }` is:
+
+```asm
+global _start
+
+_start:
+    call main
+    mov rdi, rax    ; return code
+    mov rax, 60     ; exit syscall
+    syscall
+
+main:
+    mov rax, 42
+    ret
+```
+
+Assemble + link with `nasm -felf64` and `ld`, and the resulting ELF exits with code 42.
+
 ## Troubleshooting
 
 - **`make: command not found`** — you're inside WSL Ubuntu but haven't installed `build-essential` yet; see step 2.

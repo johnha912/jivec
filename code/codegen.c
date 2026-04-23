@@ -7,8 +7,8 @@ static void generate_preamble(FILE *out_file)
     fprintf(out_file, "\n");
     fprintf(out_file, "_start:\n");
     fprintf(out_file, "    call main\n");
-    fprintf(out_file, "    mov rdi, rax\n");
-    fprintf(out_file, "    mov rax, 60\n");
+    fprintf(out_file, "    mov rdi, rax    ; return code\n");
+    fprintf(out_file, "    mov rax, 60     ; exit syscall\n");
     fprintf(out_file, "    syscall\n");
     fprintf(out_file, "\n");
 }
