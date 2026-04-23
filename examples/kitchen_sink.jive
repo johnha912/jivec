@@ -1,0 +1,17 @@
+// kitchen sink — exercise every keyword, type, and symbol
+fn add(a: int, b: int) -> int {
+    let x: int
+    set x (a + b - 1 * 2 / 3 % 4)
+    set x (x & 7 | 8 ^ 9)
+    if x == 0 && !false || true {
+        return ~x
+    }
+    while x >= 10 && x <= 100 {
+        set x (x - 1)
+    }
+    call print("hi\n")
+    if x != 5 {
+        return x
+    }
+    return 0
+}
