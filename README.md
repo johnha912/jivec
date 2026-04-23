@@ -13,9 +13,9 @@ Jive is a small teaching language designed by **Professor Lothar Narins** for CS
 ## Status
 
 - [x] Stage 1 — lexer
-- [ ] Stage 2 — parser
+- [x] Stage 2 — parser + minimal codegen (empty-param `fn`s whose body is `return <int>`)
 - [ ] Stage 3 — type checker
-- [ ] Stage 4 — NASM code generator
+- [ ] Stage 4 — full NASM code generator
 
 ## Language overview
 
@@ -68,66 +68,97 @@ make --version
 ```sh
 git clone https://github.com/johnha912/jivec.git
 cd jivec
-make
+cd code && ./build.sh
 ```
 
-If the build succeeds you will see the binary at `build/test_lexer`.
+`code/build.sh` is the canonical build script: it compiles `code/main.c` (a unity-build translation unit that `#include`s `string.c`, `lexer.c`, `parser.c`, and `codegen.c`) into `build/jive`, then smoke-tests the compiler on the sample programs in `jive_programs/`.
 
-Prefer to invoke `gcc` directly? The project is a **unity build** (each executable is a single translation unit that `#include`s the `.c` files it needs), so one command is enough:
+A `Makefile` at the repo root is also provided as a convenience:
+
+```sh
+make            # builds build/jive and build/test_lexer
+```
+
+Prefer to invoke `gcc` directly? One command is enough:
 
 ```sh
 mkdir -p build
 gcc -Wall -Wextra -Wpedantic -std=c11 -O0 -g \
-    -o build/test_lexer src/test_lexer.c
+    -o build/jive code/main.c
 ```
 
-### 4. Run the lexer on an example
+### 4. Compile a Jive program
 
 ```
-$ ./build/test_lexer examples/simple.jive
-examples/simple.jive:1:1    KEYWORD      fn
-examples/simple.jive:1:4    IDENTIFIER   main
-examples/simple.jive:1:8    (
-examples/simple.jive:1:9    )
-examples/simple.jive:1:11   ->
-examples/simple.jive:1:14   TYPE         int
-examples/simple.jive:2:1    {
-examples/simple.jive:3:5    KEYWORD      return
-examples/simple.jive:3:12   INTEGER      42
-examples/simple.jive:4:1    }
-examples/simple.jive:5:1    EOF
+$ ./build/jive jive_programs/simple.jive -o build/simple.asm
+$ cat build/simple.asm
+global _start
+
+_start:
+    call main
+    mov rdi, rax
+    mov rax, 60
+    syscall
+
+main:
+    mov rax, 42
+    ret
 ```
 
-More sample programs live in [`examples/`](examples/).
+Useful flags:
+
+- `-o <file>` — output assembly path (defaults to `out.asm`)
+- `--dump-tokens` — print the lexer output
+- `--dump-ast` — print the parsed abstract syntax tree
+
+You can assemble and link the output with NASM + `ld` to produce a runnable ELF:
+
+```sh
+cd build
+nasm -felf64 simple.asm -o simple.o
+ld simple.o -o simple
+./simple; echo "exit=$?"   # prints: exit=42
+```
+
+Need just the lexer? `build/test_lexer` is still built alongside `jive`:
+
+```sh
+./build/test_lexer jive_programs/simple.jive
+```
 
 ### 5. Write your own Jive program
 
-Create a file `hello.jive`:
+Create a file `hello.jive` under `jive_programs/` (or anywhere):
 
 ```jive
 fn main() -> int
 {
     // comments are ignored
-    return 7 + 35
+    return 42
 }
 ```
 
-Then lex it:
+Then compile it:
 
 ```sh
-./build/test_lexer hello.jive
+./build/jive hello.jive -o hello.asm
 ```
 
 ## Project layout
 
 ```
-src/
+code/
+  string.c       String type, PRINT_STRING macro, small helpers
   lexer.h        token and public API definitions
   lexer.c        lexer implementation
+  parser.c       AST definitions + recursive-descent parser
+  codegen.c      NASM emitter
+  main.c         unity-build entry for the jive compiler
   test_lexer.c   unity-build entry for the lexer test driver
-examples/        sample .jive programs
-Makefile         build rules
-build/           compiled binaries (git-ignored)
+  build.sh       canonical build script (cd code && ./build.sh)
+jive_programs/   sample .jive input programs
+Makefile         convenience wrapper
+build/           compiled binaries and .asm output (git-ignored)
 ```
 
 ## Troubleshooting

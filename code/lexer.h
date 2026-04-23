@@ -64,11 +64,7 @@ typedef enum Type
     TYPE_BOOL,
 } Type;
 
-typedef struct String
-{
-    char *data;
-    long count;
-} String;
+// String is defined in string.c; include string.c before lexer.h in the unity build.
 
 typedef struct Loc
 {

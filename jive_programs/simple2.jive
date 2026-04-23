@@ -1,0 +1,15 @@
+fn main() -> int
+{
+	return 42
+}
+
+fn foo() -> int
+{
+	return 64
+}
+
+fn  bar(  ) -> int{
+	return 123
+}
+
+fn baz()->int{return 17}

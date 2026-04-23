@@ -1,3 +1,4 @@
+#include "string.c"
 #include "lexer.c"
 
 #include <stdio.h>
