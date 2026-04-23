@@ -17,9 +17,11 @@ Jive is a small teaching language designed by **Professor Lothar Narins** for CS
 - [ ] Stage 3 — type checker
 - [ ] Stage 4 — full NASM code generator
 
-## Language overview
+## The Jive language
 
-A minimal Jive program:
+Jive is a small, statically-typed language with a Rust-flavored syntax. A program is a sequence of function definitions, and `main` is the entry point — the compiler calls it and uses its return value as the process exit code.
+
+### A minimal program
 
 ```jive
 fn main() -> int
@@ -28,10 +30,113 @@ fn main() -> int
 }
 ```
 
+Build it, then run the assembled binary:
+
+```sh
+./build/jive hello.jive -o hello.asm
+nasm -felf64 hello.asm -o hello.o && ld hello.o -o hello
+./hello; echo "exit=$?"   # exit=42
+```
+
+### Keywords, types, and operators
+
 - **Keywords:** `fn` `let` `set` `if` `while` `call` `return` `true` `false`
 - **Types:** `int` `str` `bool`
-- **Symbols:** `+ - * / % & | ^ == != < > <= >= && || ~ ! ( ) [ ] { } , : ->`
+- **Unary operators:** `-` `~` `!`
+- **Binary operators:** `+ - * / %` &nbsp; `& | ^` &nbsp; `== != < > <= >=` &nbsp; `&& ||`
+- **Grouping / punctuation:** `( )` `[ ]` `{ }` `,` `:` `->`
 - **Comments:** `// ...` to end of line
+
+### Statements
+
+| Statement | Form                                  | Purpose                                          |
+|-----------|---------------------------------------|--------------------------------------------------|
+| `let`     | `let name: type [= expr]`             | declare a variable, optionally initialized      |
+| `set`     | `set name = expr`                     | assign to an existing variable                  |
+| `return`  | `return [expr]`                       | return from the current function                |
+| `if`      | `if cond stmt [else stmt]`            | conditional branch                              |
+| `while`   | `while cond stmt`                     | loop                                            |
+| `call`    | `call fn_name(args)`                  | invoke a function for its side effects          |
+
+A `stmt` may be any single statement or a `{ ... }` block.
+
+### Examples
+
+Recursive Fibonacci:
+
+```jive
+fn fib(n: int) -> int
+{
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() -> int
+{
+    return fib(10)
+}
+```
+
+A loop with side-effectful calls (assuming built-ins `print_int` and `print_nl`):
+
+```jive
+fn main() -> int
+{
+    let n: int = 0
+    while n < 10 {
+        call print_int(n)
+        call print_nl()
+        set n = n + 1
+    }
+    return n - 10
+}
+```
+
+### Grammar (EBNF)
+
+```ebnf
+letter          = "A"-"Z" | "a"-"z" ;
+digit           = "0"-"9" ;
+identifier      = ( "_" | letter ) , { "_" | letter | digit } ;
+number          = digit , { digit } ;
+string          = '"' , { ? all characters ? - ( '"' | '\n' ) } , '"' ;
+
+type            = "int" | "str" | "bool" ;
+primitive       = ( identifier , { subscript } )
+                | number
+                | call_expr
+                | ( "(" , expr , ")" ) ;
+unop            = "-" | "~" | "!" ;
+binop           = "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^"
+                | "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" ;
+term            = { unop } , primitive ;
+expr            = term , { binop , term } ;
+expr_list       = expr , { "," , expr } ;
+argument_list   = "(" , [ expr_list ] , ")" ;
+call_expr       = identifier , argument_list ;
+subscript       = "[" , expr , "]" ;
+
+call_stmt       = "call" , call_expr ;
+let             = "let" , identifier , ":" , type , [ "=" , expr ] ;
+set             = "set" , identifier , { subscript } , "=" , expr ;
+return          = "return" , [ expr ] ;
+if              = "if" , expr , statement , [ "else" , statement ] ;
+while           = "while" , expr , statement ;
+statement       = call_stmt | let | set | return | if | while | block ;
+block           = "{" , { statement } , "}" ;
+
+id_type         = identifier , ":" , type ;
+id_type_list    = id_type , { "," , id_type } ;
+parameter_list  = "(" , [ id_type_list ] , ")" ;
+fn_definition   = "fn" , identifier , parameter_list , [ "->" , type ] , block ;
+program         = { fn_definition } ;
+```
+
+### What compiles today
+
+The lexer (Stage 1) recognises the full token set above. The parser + code generator (Stage 2) currently accept a restricted subset: **zero-parameter functions whose body is a single `return <integer literal>` statement.** Anything beyond that — parameters, `let`/`set`, `if`/`while`, expressions, function calls — is planned for Stages 3–4. Programs that exceed the current subset are rejected with a `file:line:col: error: ...` diagnostic.
 
 ## Getting started
 
