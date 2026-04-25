@@ -147,7 +147,7 @@ static void emit_expression(IR_Builder *builder, AST_Node *expr)
         } break;
 
         case AST_IDENT: {
-            Symbol *sym = symbol_table_lookup(builder->symbols, expr->ident_name);
+            Symbol_Data *sym = lookup_symbol(builder->symbols, expr->ident_name);
             if (!sym) {
                 char msg[256];
                 snprintf(msg, sizeof(msg),
@@ -158,7 +158,7 @@ static void emit_expression(IR_Builder *builder, AST_Node *expr)
             }
             IR_Op op = {0};
             op.kind = IR_LOAD_LOCAL;
-            op.frame_offset = sym->frame_offset;
+            op.frame_offset = symbol_frame_offset(builder->symbols, sym);
             ir_program_append(builder->prog, op);
         } break;
 
@@ -194,8 +194,8 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
         case AST_LET: {
             // Reserve the slot first so the initializer can reference earlier
             // variables, then run the initializer and pop into the new slot.
-            Symbol *sym = symbol_table_declare_local(builder->symbols,
-                                                     stmt->let.name, stmt->let.type);
+            Symbol_Data *sym = declare_local(builder->symbols,
+                                             stmt->let.name, stmt->let.type, stmt->loc);
             if (!sym) {
                 char msg[256];
                 snprintf(msg, sizeof(msg),
@@ -209,13 +209,13 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
                 if (builder->has_error) return;
                 IR_Op op = {0};
                 op.kind = IR_STORE_LOCAL;
-                op.frame_offset = sym->frame_offset;
+                op.frame_offset = symbol_frame_offset(builder->symbols, sym);
                 ir_program_append(builder->prog, op);
             }
         } break;
 
         case AST_SET: {
-            Symbol *sym = symbol_table_lookup(builder->symbols, stmt->set.name);
+            Symbol_Data *sym = lookup_symbol(builder->symbols, stmt->set.name);
             if (!sym) {
                 char msg[256];
                 snprintf(msg, sizeof(msg),
@@ -228,7 +228,7 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
             if (builder->has_error) return;
             IR_Op op = {0};
             op.kind = IR_STORE_LOCAL;
-            op.frame_offset = sym->frame_offset;
+            op.frame_offset = symbol_frame_offset(builder->symbols, sym);
             ir_program_append(builder->prog, op);
         } break;
 
@@ -266,12 +266,11 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
 
 static void emit_function(IR_Builder *builder, AST_Node *fn_node)
 {
-    // Each function gets a fresh symbol table so locals don't leak between
+    // Each function gets a fresh symbol table so names don't leak between
     // functions. Parameters are declared first (they live in the caller's
     // frame), then locals get assigned slots as `let` statements appear in
     // the body. We patch IR_FN's `n_locals` once the body is lowered.
-    Symbol_Table table = {0};
-    symbol_table_init(&table);
+    Symbol_Table table = make_symbol_table(16);
 
     long fn_op_index = builder->prog->count;
     IR_Op enter = {0};
@@ -283,11 +282,13 @@ static void emit_function(IR_Builder *builder, AST_Node *fn_node)
     Symbol_Table *prev_symbols = builder->symbols;
     builder->symbols = &table;
 
-    long n_params = fn_node->fn.parameters.count;
+    // Set n_params up front so symbol_frame_offset works even if a duplicate
+    // parameter name aborts one of the inserts below.
+    table.n_params = fn_node->fn.parameters.count;
     long param_index = 0;
     for (AST_Node *p = fn_node->fn.parameters.first; p != NULL; p = p->next) {
-        Symbol *sym = symbol_table_declare_param(&table, p->param.name, p->param.type,
-                                                 param_index, n_params);
+        Symbol_Data *sym = declare_param(&table, p->param.name, p->param.type,
+                                         param_index, p->loc);
         if (!sym) {
             char msg[256];
             snprintf(msg, sizeof(msg),
@@ -307,7 +308,7 @@ static void emit_function(IR_Builder *builder, AST_Node *fn_node)
     builder->prog->items[fn_op_index].fn.n_locals = table.n_locals;
 
     builder->symbols = prev_symbols;
-    symbol_table_free(&table);
+    free_symbol_table(&table);
 
     IR_Op leave = {0};
     leave.kind = IR_END_FN;
