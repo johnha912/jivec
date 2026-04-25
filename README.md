@@ -289,12 +289,18 @@ build/            compiled binaries and .asm output (git-ignored)
 
 `jive` is a four-stage pipeline: each stage turns the previous stage's output into something closer to machine code.
 
-```
-  source.jive ──► lexer ──► tokens ──► parser ──► AST ──► ir.c ──► IR ──► codegen ──► out.asm
-  (text)                   (stream)            (tree)    │      (stack ops)        (NASM)
-                                                          ▼
-                                                     symbol table
-                                                  (per-function locals)
+```mermaid
+flowchart LR
+    src["source.jive<br/>(text)"] --> lexer[lexer]
+    lexer --> tokens["tokens<br/>(stream)"]
+    tokens --> parser[parser]
+    parser --> ast["AST<br/>(tree)"]
+    ast --> ir[ir.c]
+    ir --> irprog["IR<br/>(stack ops)"]
+    irprog --> codegen[codegen]
+    codegen --> asm["out.asm<br/>(NASM)"]
+
+    ir <-->|declare / lookup| symtab[("symbol table<br/>per-function locals")]
 ```
 
 **Lexer** ([code/lexer.c](code/lexer.c)). Scans the source character by character and groups characters into tokens — keywords, identifiers, numbers, strings, punctuation. Whitespace and `//` comments are dropped. Each token carries its `file:line:col` location so later stages can report errors that point back to the source.
