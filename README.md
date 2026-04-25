@@ -10,6 +10,32 @@ A from-scratch compiler for **Jive**, written in C, targeting x86-64 NASM assemb
 
 Jive is a small teaching language designed by **Professor Lothar Narins** for CS 5008 at Northeastern University. `jivec` is my implementation of the course compiler — built up stage by stage, from lexer to codegen.
 
+<details>
+<summary><strong>Table of contents</strong></summary>
+
+- [Status](#status)
+- [The Jive language](#the-jive-language)
+  - [A minimal program](#a-minimal-program)
+  - [Keywords, types, and operators](#keywords-types-and-operators)
+  - [Statements](#statements)
+  - [Examples](#examples)
+  - [Grammar (EBNF)](#grammar-ebnf)
+- [Getting started](#getting-started)
+  - [1. Install WSL Ubuntu (Windows only)](#1-install-wsl-ubuntu-windows-only)
+  - [2. Install build tools](#2-install-build-tools)
+  - [3. Clone and build](#3-clone-and-build)
+  - [4. Compile a Jive program](#4-compile-a-jive-program)
+  - [5. Write your own Jive program](#5-write-your-own-jive-program)
+- [Project layout](#project-layout)
+- [How the compiler works](#how-the-compiler-works)
+- [Troubleshooting](#troubleshooting)
+- [Stage summary](#stage-summary)
+- [References](#references)
+- [Credits](#credits)
+- [License](#license)
+
+</details>
+
 ## Status
 
 - [x] Stage 1 — lexer
