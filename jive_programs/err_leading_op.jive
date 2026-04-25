@@ -1,0 +1,4 @@
+fn bar() -> int
+{
+    return / 5
+}

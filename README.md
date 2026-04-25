@@ -14,8 +14,8 @@ Jive is a small teaching language designed by **Professor Lothar Narins** for CS
 
 - [x] Stage 1 — lexer
 - [x] Stage 2 — parser + minimal codegen (empty-param `fn`s whose body is `return <int>`)
-- [ ] Stage 3 — type checker
-- [ ] Stage 4 — full NASM code generator
+- [x] Stage 3 — arithmetic expressions + stack-machine IR
+- [ ] Stage 4 — assemble & link the emitted NASM
 
 ## The Jive language
 
@@ -134,10 +134,6 @@ fn_definition   = "fn" , identifier , parameter_list , [ "->" , type ] , block ;
 program         = { fn_definition } ;
 ```
 
-### What compiles today
-
-The lexer (Stage 1) recognises the full token set above. The parser + code generator (Stage 2) currently accept a restricted subset: **zero-parameter functions whose body is a single `return <integer literal>` statement.** Anything beyond that — parameters, `let`/`set`, `if`/`while`, expressions, function calls — is planned for Stages 3–4. Programs that exceed the current subset are rejected with a `file:line:col: error: ...` diagnostic.
-
 ## Getting started
 
 `jivec` is developed and tested on **Linux**. On Windows, the recommended setup is **WSL with Ubuntu** — this matches the grading environment for CS 5008 and avoids Windows-specific toolchain quirks. Native Linux and macOS should also work, but WSL Ubuntu is the path that has been verified.
@@ -176,7 +172,7 @@ cd jivec
 cd code && ./build.sh
 ```
 
-`code/build.sh` is the canonical build script: it compiles `code/main.c` (a unity-build translation unit that `#include`s `string.c`, `lexer.c`, `parser.c`, and `codegen.c`) into `build/jive`, then smoke-tests the compiler on the sample programs in `jive_programs/`.
+`code/build.sh` is the canonical build script: it compiles `code/main.c` (a unity-build translation unit that `#include`s `string.c`, `lexer.c`, `parser.c`, `ir.c`, and `codegen.c`) into `build/jive`, then smoke-tests the compiler on the sample programs in `jive_programs/`.
 
 A `Makefile` at the repo root is also provided as a convenience:
 
@@ -201,12 +197,15 @@ global _start
 
 _start:
     call main
-    mov rdi, rax
-    mov rax, 60
+    mov rdi, rax    ; return code
+    mov rax, 60     ; exit syscall
     syscall
 
 main:
-    mov rax, 42
+    push 42   ; PUSH 42
+
+    ; RETURN
+    pop rax
     ret
 ```
 
@@ -215,6 +214,7 @@ Useful flags:
 - `-o <file>` — output assembly path (defaults to `out.asm`)
 - `--dump-tokens` — print the lexer output
 - `--dump-ast` — print the parsed abstract syntax tree
+- `--dump-ir` — print the stack-machine intermediate representation
 
 You can assemble and link the output with NASM + `ld` to produce a runnable ELF:
 
@@ -257,7 +257,8 @@ code/
   lexer.h        token and public API definitions
   lexer.c        lexer implementation
   parser.c       AST definitions + recursive-descent parser
-  codegen.c      NASM emitter
+  ir.c           stack-machine IR + AST→IR lowering
+  codegen.c      NASM emitter (consumes IR)
   main.c         unity-build entry for the jive compiler
   test_lexer.c   unity-build entry for the lexer test driver
   build.sh       canonical build script (cd code && ./build.sh)
@@ -268,16 +269,16 @@ build/           compiled binaries and .asm output (git-ignored)
 
 ## How the compiler works
 
-`jive` is a classic three-stage pipeline: each stage turns the previous stage's output into something closer to machine code.
+`jive` is a four-stage pipeline: each stage turns the previous stage's output into something closer to machine code.
 
 ```
-  source.jive   ──► lexer ──► tokens ──► parser ──► AST ──► codegen ──► out.asm
-  (text)                     (stream)              (tree)              (NASM)
+  source.jive ──► lexer ──► tokens ──► parser ──► AST ──► ir.c ──► IR ──► codegen ──► out.asm
+  (text)                   (stream)            (tree)           (stack ops)        (NASM)
 ```
 
 **Lexer** ([code/lexer.c](code/lexer.c)). Scans the source character by character and groups characters into tokens — keywords, identifiers, numbers, strings, punctuation. Whitespace and `//` comments are dropped. Each token carries its `file:line:col` location so later stages can report errors that point back to the source.
 
-**Parser** ([code/parser.c](code/parser.c)). A recursive-descent parser that walks the token stream following the [Jive EBNF grammar](#grammar-ebnf) and builds an abstract syntax tree. Each grammar rule (`parse_program`, `parse_fn_def`, `parse_block`, `parse_statement`, `parse_expression`) consumes exactly the tokens its rule covers. Mismatches turn into `file:line:col: error: expected X, got Y` diagnostics. The AST is a tree of `AST_Node`s linked together with `AST_List` (head + tail + count, doubly linked).
+**Parser** ([code/parser.c](code/parser.c)). A recursive-descent parser that walks the token stream following the [Jive EBNF grammar](#grammar-ebnf) and builds an abstract syntax tree. Each grammar rule (`parse_program`, `parse_fn_def`, `parse_block`, `parse_statement`) consumes exactly the tokens it owns. Expressions are handled by a precedence-climbing trio — `parse_primary` (integer literal or `(` expr `)`), `parse_multiplicative` (`* / %`), and `parse_additive` (`+ -`) — that produces a left-associated tree where `*`/`/`/`%` bind tighter than `+`/`-`. Mismatches turn into `file:line:col: error: expected X, got Y` diagnostics. The AST is a tree of `AST_Node`s linked together with `AST_List` (head + tail + count, doubly linked).
 
 Dump the AST with `--dump-ast`:
 
@@ -290,7 +291,27 @@ program
       integer 42
 ```
 
-**Code generator** ([code/codegen.c](code/codegen.c)). Walks the AST top-down and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then visits each `fn` node to emit a label, walks the body, and emits `mov rax, <N>` + `ret` for each `return <int>` statement.
+**IR generator** ([code/ir.c](code/ir.c)). Lowers each function's AST into a flat sequence of stack-machine instructions: `FN`, `END_FN`, `PUSH <n>`, `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `RETURN`. Expressions are emitted in post-order, so operands are pushed before the op that consumes them. For example, `return 2 + 3 * 4 - 5` becomes:
+
+```
+$ ./build/jive jive_programs/expr.jive --dump-ir -o /dev/null
+=== ir ===
+FN main
+PUSH 2
+PUSH 3
+PUSH 4
+MUL
+ADD
+PUSH 5
+SUB
+RETURN
+END_FN
+...
+```
+
+This level decouples "what to compute" from "how to emit machine code" — the IR is small, easy to read with `--dump-ir`, and pleasant to debug.
+
+**Code generator** ([code/codegen.c](code/codegen.c)). Walks the IR linearly and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then translates each IR op directly: `PUSH n` becomes `push n`, binary ops pop right-hand-side into `rcx` and left-hand-side into `rax`, compute, and re-push, and `RETURN` pops the result into `rax` before `ret`. `DIV` / `MOD` use `cqo` + `idiv` for signed 64-bit division.
 
 The output for `fn main() -> int { return 42 }` is:
 
@@ -304,7 +325,10 @@ _start:
     syscall
 
 main:
-    mov rax, 42
+    push 42   ; PUSH 42
+
+    ; RETURN
+    pop rax
     ret
 ```
 

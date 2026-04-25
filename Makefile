@@ -8,7 +8,7 @@ JIVE_BIN  := $(BUILD_DIR)/jive
 JIVE_SRC  := $(CODE_DIR)/main.c
 JIVE_DEPS := $(CODE_DIR)/string.c \
              $(CODE_DIR)/lexer.c $(CODE_DIR)/lexer.h \
-             $(CODE_DIR)/parser.c $(CODE_DIR)/codegen.c
+             $(CODE_DIR)/parser.c $(CODE_DIR)/ir.c $(CODE_DIR)/codegen.c
 
 TEST_LEXER_BIN  := $(BUILD_DIR)/test_lexer
 TEST_LEXER_SRC  := $(CODE_DIR)/test_lexer.c

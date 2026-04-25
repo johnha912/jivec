@@ -6,6 +6,7 @@
 #include "string.c"
 #include "lexer.c"
 #include "parser.c"
+#include "ir.c"
 #include "codegen.c"
 
 typedef struct Options
@@ -14,12 +15,13 @@ typedef struct Options
     const char *out_file_name;
     bool dump_tokens;
     bool dump_ast;
+    bool dump_ir;
 } Options;
 
 static void print_usage(const char *program_name)
 {
     fprintf(stderr,
-            "Usage: %s <input.jive> [-o output.asm] [--dump-tokens] [--dump-ast]\n",
+            "Usage: %s <input.jive> [-o output.asm] [--dump-tokens] [--dump-ast] [--dump-ir]\n",
             program_name);
 }
 
@@ -43,6 +45,8 @@ int main(int arg_count, const char **args)
             options.dump_tokens = true;
         } else if (strcmp(arg, "--dump-ast") == 0) {
             options.dump_ast = true;
+        } else if (strcmp(arg, "--dump-ir") == 0) {
+            options.dump_ir = true;
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             print_usage(program_name);
             return 0;
@@ -79,15 +83,24 @@ int main(int arg_count, const char **args)
         print_ast(parse_result.ast);
     }
 
+    IR_Program ir = ir_from_ast(parse_result.ast);
+
+    if (options.dump_ir) {
+        printf("=== ir ===\n");
+        print_ir(&ir);
+    }
+
     FILE *out_file = fopen(options.out_file_name, "w");
     if (!out_file) {
         fprintf(stderr, "error: could not open '%s' for writing\n", options.out_file_name);
+        ir_program_free(&ir);
         token_array_free(&tokens);
         return 1;
     }
 
-    bool ok = generate_asm(parse_result.ast, out_file);
+    bool ok = generate_asm(&ir, out_file);
     fclose(out_file);
+    ir_program_free(&ir);
     token_array_free(&tokens);
 
     return ok ? 0 : 1;

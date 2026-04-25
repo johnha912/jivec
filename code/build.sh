@@ -35,6 +35,15 @@ if [ $ret_val -ne 0 ]; then
 	exit $ret_val
 fi
 
+echo === TEST ON EXPR.JIVE ===
+
+./jive ../jive_programs/expr.jive -o expr.asm
+ret_val=$?
+if [ $ret_val -ne 0 ]; then
+	echo ERROR: Compiler returned an error compiling expr.jive
+	exit $ret_val
+fi
+
 # Stage 4 will enable assembling + linking the .asm output.
 # nasm -felf64 simple.asm
 # ret_val=$?

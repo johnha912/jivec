@@ -39,6 +39,7 @@ typedef enum AST_Kind
     AST_FN,
     AST_RETURN,
     AST_INTEGER,
+    AST_BINOP,
 } AST_Kind;
 
 static const char *ast_kind_name(AST_Kind kind)
@@ -49,6 +50,28 @@ static const char *ast_kind_name(AST_Kind kind)
         case AST_FN:      return "FN";
         case AST_RETURN:  return "RETURN";
         case AST_INTEGER: return "INTEGER";
+        case AST_BINOP:   return "BINOP";
+    }
+    return "?";
+}
+
+typedef enum Binary_Op
+{
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+    BINOP_DIV,
+    BINOP_MOD,
+} Binary_Op;
+
+static const char *binop_symbol(Binary_Op op)
+{
+    switch (op) {
+        case BINOP_ADD: return "+";
+        case BINOP_SUB: return "-";
+        case BINOP_MUL: return "*";
+        case BINOP_DIV: return "/";
+        case BINOP_MOD: return "%";
     }
     return "?";
 }
@@ -71,6 +94,13 @@ typedef struct AST_Fn_Data
     AST_List body;
 } AST_Fn_Data;
 
+typedef struct AST_Binop_Data
+{
+    Binary_Op op;
+    AST_Node *left;
+    AST_Node *right;
+} AST_Binop_Data;
+
 struct AST_Node
 {
     AST_Kind kind;
@@ -78,10 +108,11 @@ struct AST_Node
     AST_Node *prev;
     AST_Node *next;
     union {
-        AST_List    program;
-        AST_Fn_Data fn;
-        AST_Node   *ret_expr;
-        long        int_value;
+        AST_List       program;
+        AST_Fn_Data    fn;
+        AST_Node      *ret_expr;
+        long           int_value;
+        AST_Binop_Data binop;
     };
 };
 
@@ -162,7 +193,9 @@ static Token *expect_keyword(Parser *parser, Keyword expected_kw)
     return actual;
 }
 
-static AST_Node *parse_expression(Parser *parser)
+static AST_Node *parse_expression(Parser *parser);
+
+static AST_Node *parse_primary(Parser *parser)
 {
     Token *tok = peek_token(parser, 0);
     if (tok->kind == TOKEN_INTEGER) {
@@ -172,8 +205,84 @@ static AST_Node *parse_expression(Parser *parser)
         parser->tok_index++;
         return node;
     }
-    report_error_at(parser, tok->loc, "expected an expression (integer literal)");
+    if (tok->kind == TOKEN_OPEN_PAREN) {
+        parser->tok_index++;
+        AST_Node *inner = parse_expression(parser);
+        if (parser->has_error) return inner;
+        Token *close = peek_token(parser, 0);
+        if (close->kind != TOKEN_CLOSE_PAREN) {
+            report_error_at(parser, close->loc, "expected ')' to close parenthesized expression");
+            return inner;
+        }
+        parser->tok_index++;
+        return inner;
+    }
+    report_error_at(parser, tok->loc, "expected an expression");
     return NULL;
+}
+
+static AST_Node *parse_multiplicative(Parser *parser)
+{
+    AST_Node *left = parse_primary(parser);
+    if (parser->has_error) return left;
+
+    for (;;) {
+        Token *tok = peek_token(parser, 0);
+        Binary_Op op;
+        if      (tok->kind == TOKEN_STAR)    op = BINOP_MUL;
+        else if (tok->kind == TOKEN_SLASH)   op = BINOP_DIV;
+        else if (tok->kind == TOKEN_PERCENT) op = BINOP_MOD;
+        else break;
+
+        Loc op_loc = tok->loc;
+        parser->tok_index++;
+
+        AST_Node *right = parse_primary(parser);
+        if (parser->has_error) return left;
+
+        AST_Node *node = make_ast_node(AST_BINOP);
+        node->loc = op_loc;
+        node->binop.op = op;
+        node->binop.left = left;
+        node->binop.right = right;
+        left = node;
+    }
+
+    return left;
+}
+
+static AST_Node *parse_additive(Parser *parser)
+{
+    AST_Node *left = parse_multiplicative(parser);
+    if (parser->has_error) return left;
+
+    for (;;) {
+        Token *tok = peek_token(parser, 0);
+        Binary_Op op;
+        if      (tok->kind == TOKEN_PLUS)  op = BINOP_ADD;
+        else if (tok->kind == TOKEN_MINUS) op = BINOP_SUB;
+        else break;
+
+        Loc op_loc = tok->loc;
+        parser->tok_index++;
+
+        AST_Node *right = parse_multiplicative(parser);
+        if (parser->has_error) return left;
+
+        AST_Node *node = make_ast_node(AST_BINOP);
+        node->loc = op_loc;
+        node->binop.op = op;
+        node->binop.left = left;
+        node->binop.right = right;
+        left = node;
+    }
+
+    return left;
+}
+
+static AST_Node *parse_expression(Parser *parser)
+{
+    return parse_additive(parser);
 }
 
 static AST_Node *parse_statement(Parser *parser)
@@ -307,6 +416,12 @@ static void print_ast_with_indent(AST_Node *node, int depth)
 
         case AST_INTEGER: {
             printf("%*sinteger %ld\n", 2 * depth, "", node->int_value);
+        } break;
+
+        case AST_BINOP: {
+            printf("%*sbinop %s\n", 2 * depth, "", binop_symbol(node->binop.op));
+            print_ast_with_indent(node->binop.left,  depth + 1);
+            print_ast_with_indent(node->binop.right, depth + 1);
         } break;
 
         default: {
