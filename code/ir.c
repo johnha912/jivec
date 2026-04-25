@@ -31,6 +31,17 @@ typedef enum IR_Op_Kind
     IR_MUL,
     IR_DIV,
     IR_MOD,
+    IR_EQ,
+    IR_NEQ,
+    IR_LT,
+    IR_LE,
+    IR_GT,
+    IR_GE,
+    IR_AND,
+    IR_OR,
+    IR_LABEL,
+    IR_JMP,
+    IR_JMP_IF_FALSE,
     IR_CALL,
     IR_DROP,
     IR_RETURN,
@@ -42,6 +53,7 @@ typedef struct IR_Op
     union {
         long push_value;
         long frame_offset;       // for IR_LOAD_LOCAL / IR_STORE_LOCAL
+        long label_id;           // for IR_LABEL / IR_JMP / IR_JMP_IF_FALSE
         struct {
             String name;
             long   n_locals;     // valid only on IR_FN; backpatched after the body
@@ -71,6 +83,7 @@ typedef struct IR_Builder
     IR_Program   *prog;
     Symbol_Table *symbols;
     bool          has_error;
+    long          next_label_id;   // monotonic counter for if/while branch labels
 } IR_Builder;
 
 static const char *ir_op_kind_name(IR_Op_Kind kind)
@@ -86,6 +99,17 @@ static const char *ir_op_kind_name(IR_Op_Kind kind)
         case IR_MUL:          return "MUL";
         case IR_DIV:          return "DIV";
         case IR_MOD:          return "MOD";
+        case IR_EQ:           return "EQ";
+        case IR_NEQ:          return "NEQ";
+        case IR_LT:           return "LT";
+        case IR_LE:           return "LE";
+        case IR_GT:           return "GT";
+        case IR_GE:           return "GE";
+        case IR_AND:          return "AND";
+        case IR_OR:           return "OR";
+        case IR_LABEL:        return "LABEL";
+        case IR_JMP:          return "JMP";
+        case IR_JMP_IF_FALSE: return "JMP_IF_FALSE";
         case IR_CALL:         return "CALL";
         case IR_DROP:         return "DROP";
         case IR_RETURN:       return "RETURN";
@@ -119,6 +143,14 @@ static IR_Op_Kind ir_op_for_binop(Binary_Op op)
         case BINOP_MUL: return IR_MUL;
         case BINOP_DIV: return IR_DIV;
         case BINOP_MOD: return IR_MOD;
+        case BINOP_EQ:  return IR_EQ;
+        case BINOP_NEQ: return IR_NEQ;
+        case BINOP_LT:  return IR_LT;
+        case BINOP_LE:  return IR_LE;
+        case BINOP_GT:  return IR_GT;
+        case BINOP_GE:  return IR_GE;
+        case BINOP_AND: return IR_AND;
+        case BINOP_OR:  return IR_OR;
     }
     return IR_ADD;
 }
@@ -256,6 +288,95 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
             ir_program_append(builder->prog, op);
         } break;
 
+        case AST_BLOCK: {
+            // A block is a flat sequence of statements at the same scope.
+            // We do not introduce a new scope here, so any `let` declared
+            // inside the block lives in the enclosing function's symbol
+            // table — matching the language's flat per-function scoping.
+            for (AST_Node *s = stmt->block.first; s != NULL; s = s->next) {
+                emit_statement(builder, s);
+            }
+        } break;
+
+        case AST_IF: {
+            //   <cond>
+            //   JMP_IF_FALSE  L_else_or_end
+            //   <then>
+            //   [JMP L_end          ; only when there is an else clause]
+            //   [L_else: <else>]
+            //   L_end:
+            long else_or_end = builder->next_label_id++;
+            emit_expression(builder, stmt->if_stmt.cond);
+            if (builder->has_error) return;
+
+            IR_Op jmp_if_false = {0};
+            jmp_if_false.kind = IR_JMP_IF_FALSE;
+            jmp_if_false.label_id = else_or_end;
+            ir_program_append(builder->prog, jmp_if_false);
+
+            emit_statement(builder, stmt->if_stmt.then_branch);
+
+            if (stmt->if_stmt.else_branch) {
+                long end_label = builder->next_label_id++;
+                IR_Op jmp_end = {0};
+                jmp_end.kind = IR_JMP;
+                jmp_end.label_id = end_label;
+                ir_program_append(builder->prog, jmp_end);
+
+                IR_Op else_label = {0};
+                else_label.kind = IR_LABEL;
+                else_label.label_id = else_or_end;
+                ir_program_append(builder->prog, else_label);
+
+                emit_statement(builder, stmt->if_stmt.else_branch);
+
+                IR_Op end = {0};
+                end.kind = IR_LABEL;
+                end.label_id = end_label;
+                ir_program_append(builder->prog, end);
+            } else {
+                IR_Op end = {0};
+                end.kind = IR_LABEL;
+                end.label_id = else_or_end;
+                ir_program_append(builder->prog, end);
+            }
+        } break;
+
+        case AST_WHILE: {
+            //   L_top: <cond>
+            //          JMP_IF_FALSE L_end
+            //          <body>
+            //          JMP L_top
+            //   L_end:
+            long top = builder->next_label_id++;
+            long end = builder->next_label_id++;
+
+            IR_Op top_label = {0};
+            top_label.kind = IR_LABEL;
+            top_label.label_id = top;
+            ir_program_append(builder->prog, top_label);
+
+            emit_expression(builder, stmt->while_stmt.cond);
+            if (builder->has_error) return;
+
+            IR_Op jmp_if_false = {0};
+            jmp_if_false.kind = IR_JMP_IF_FALSE;
+            jmp_if_false.label_id = end;
+            ir_program_append(builder->prog, jmp_if_false);
+
+            emit_statement(builder, stmt->while_stmt.body);
+
+            IR_Op jmp_top = {0};
+            jmp_top.kind = IR_JMP;
+            jmp_top.label_id = top;
+            ir_program_append(builder->prog, jmp_top);
+
+            IR_Op end_label = {0};
+            end_label.kind = IR_LABEL;
+            end_label.label_id = end;
+            ir_program_append(builder->prog, end_label);
+        } break;
+
         default: {
             fprintf(stderr, "ir: internal error: unexpected statement kind %s\n",
                     ast_kind_name(stmt->kind));
@@ -367,6 +488,15 @@ void print_ir(const IR_Program *prog)
             case IR_CALL:
                 printf("CALL %.*s (args=%ld)\n",
                        PRINT_STRING(op->call.name), op->call.n_args);
+                break;
+            case IR_LABEL:
+                printf("LABEL .L%ld\n", op->label_id);
+                break;
+            case IR_JMP:
+                printf("JMP .L%ld\n", op->label_id);
+                break;
+            case IR_JMP_IF_FALSE:
+                printf("JMP_IF_FALSE .L%ld\n", op->label_id);
                 break;
             default:
                 printf("%s\n", ir_op_kind_name(op->kind));

@@ -23,6 +23,7 @@ static const char *keyword_name_cstr(Keyword kw)
         case KEYWORD_LET:    return "let";
         case KEYWORD_SET:    return "set";
         case KEYWORD_IF:     return "if";
+        case KEYWORD_ELSE:   return "else";
         case KEYWORD_WHILE:  return "while";
         case KEYWORD_CALL:   return "call";
         case KEYWORD_RETURN: return "return";
@@ -41,6 +42,9 @@ typedef enum AST_Kind
     AST_LET,
     AST_SET,
     AST_RETURN,
+    AST_IF,
+    AST_WHILE,
+    AST_BLOCK,
     AST_INTEGER,
     AST_IDENT,
     AST_BINOP,
@@ -58,6 +62,9 @@ static const char *ast_kind_name(AST_Kind kind)
         case AST_LET:       return "LET";
         case AST_SET:       return "SET";
         case AST_RETURN:    return "RETURN";
+        case AST_IF:        return "IF";
+        case AST_WHILE:     return "WHILE";
+        case AST_BLOCK:     return "BLOCK";
         case AST_INTEGER:   return "INTEGER";
         case AST_IDENT:     return "IDENT";
         case AST_BINOP:     return "BINOP";
@@ -74,6 +81,14 @@ typedef enum Binary_Op
     BINOP_MUL,
     BINOP_DIV,
     BINOP_MOD,
+    BINOP_EQ,
+    BINOP_NEQ,
+    BINOP_LT,
+    BINOP_LE,
+    BINOP_GT,
+    BINOP_GE,
+    BINOP_AND,
+    BINOP_OR,
 } Binary_Op;
 
 static const char *binop_symbol(Binary_Op op)
@@ -84,6 +99,14 @@ static const char *binop_symbol(Binary_Op op)
         case BINOP_MUL: return "*";
         case BINOP_DIV: return "/";
         case BINOP_MOD: return "%";
+        case BINOP_EQ:  return "==";
+        case BINOP_NEQ: return "!=";
+        case BINOP_LT:  return "<";
+        case BINOP_LE:  return "<=";
+        case BINOP_GT:  return ">";
+        case BINOP_GE:  return ">=";
+        case BINOP_AND: return "&&";
+        case BINOP_OR:  return "||";
     }
     return "?";
 }
@@ -138,6 +161,19 @@ typedef struct AST_Call_Data
     AST_List args;     // each arg is an expression AST_Node
 } AST_Call_Data;
 
+typedef struct AST_If_Data
+{
+    AST_Node *cond;
+    AST_Node *then_branch;
+    AST_Node *else_branch;   // NULL if no `else` clause
+} AST_If_Data;
+
+typedef struct AST_While_Data
+{
+    AST_Node *cond;
+    AST_Node *body;
+} AST_While_Data;
+
 struct AST_Node
 {
     AST_Kind kind;
@@ -146,6 +182,7 @@ struct AST_Node
     AST_Node *next;
     union {
         AST_List       program;
+        AST_List       block;     // statements inside an AST_BLOCK
         AST_Fn_Data    fn;
         AST_Param_Data param;
         AST_Node      *ret_expr;
@@ -155,6 +192,8 @@ struct AST_Node
         AST_Let_Data   let;
         AST_Set_Data   set;
         AST_Call_Data  call;
+        AST_If_Data    if_stmt;
+        AST_While_Data while_stmt;
     };
 };
 
@@ -362,9 +401,73 @@ static AST_Node *parse_additive(Parser *parser)
     return left;
 }
 
+// Build a left-associated binop tree that consumes any token from
+// `kinds[0..n-1]` and pairs it with the matching `ops[i]`. The next-tighter
+// precedence level is parsed via `next`.
+static AST_Node *parse_left_assoc(Parser *parser,
+                                  AST_Node *(*next)(Parser *),
+                                  const Token_Kind *kinds,
+                                  const Binary_Op  *ops,
+                                  long n)
+{
+    AST_Node *left = next(parser);
+    if (parser->has_error) return left;
+
+    for (;;) {
+        Token *tok = peek_token(parser, 0);
+        long match = -1;
+        for (long i = 0; i < n; i++) {
+            if (tok->kind == kinds[i]) { match = i; break; }
+        }
+        if (match < 0) break;
+
+        Loc op_loc = tok->loc;
+        parser->tok_index++;
+
+        AST_Node *right = next(parser);
+        if (parser->has_error) return left;
+
+        AST_Node *node = make_ast_node(AST_BINOP);
+        node->loc = op_loc;
+        node->binop.op = ops[match];
+        node->binop.left = left;
+        node->binop.right = right;
+        left = node;
+    }
+    return left;
+}
+
+static AST_Node *parse_relational(Parser *parser)
+{
+    static const Token_Kind kinds[] = { TOKEN_LT, TOKEN_LT_EQ, TOKEN_GT, TOKEN_GT_EQ };
+    static const Binary_Op  ops[]   = { BINOP_LT, BINOP_LE,    BINOP_GT, BINOP_GE     };
+    return parse_left_assoc(parser, parse_additive, kinds, ops, 4);
+}
+
+static AST_Node *parse_equality(Parser *parser)
+{
+    static const Token_Kind kinds[] = { TOKEN_EQ_EQ, TOKEN_BANG_EQ };
+    static const Binary_Op  ops[]   = { BINOP_EQ,    BINOP_NEQ     };
+    return parse_left_assoc(parser, parse_relational, kinds, ops, 2);
+}
+
+static AST_Node *parse_logical_and(Parser *parser)
+{
+    static const Token_Kind kinds[] = { TOKEN_AMP_AMP };
+    static const Binary_Op  ops[]   = { BINOP_AND     };
+    return parse_left_assoc(parser, parse_equality, kinds, ops, 1);
+}
+
+static AST_Node *parse_logical_or(Parser *parser)
+{
+    static const Token_Kind kinds[] = { TOKEN_PIPE_PIPE };
+    static const Binary_Op  ops[]   = { BINOP_OR        };
+    return parse_left_assoc(parser, parse_logical_and, kinds, ops, 1);
+}
+
 static AST_Node *parse_expression(Parser *parser)
 {
-    return parse_additive(parser);
+    return parse_logical_or(parser);
 }
 
 static AST_Node *parse_let_statement(Parser *parser)
@@ -434,14 +537,74 @@ static AST_Node *parse_call_statement(Parser *parser)
     return node;
 }
 
+// Forward declarations: blocks contain statements, statements may be blocks.
+static AST_Node *parse_statement(Parser *parser);
+static AST_List parse_block(Parser *parser);
+
+static AST_Node *parse_block_statement(Parser *parser)
+{
+    AST_Node *node = make_ast_node(AST_BLOCK);
+    Token *brace = peek_token(parser, 0);
+    node->loc = brace->loc;
+    node->block = parse_block(parser);
+    return node;
+}
+
+static AST_Node *parse_if_statement(Parser *parser)
+{
+    AST_Node *node = make_ast_node(AST_IF);
+    Token *if_kw = peek_token(parser, 0);
+    node->loc = if_kw->loc;
+    parser->tok_index++; // consume 'if'
+
+    AST_Node *cond = parse_expression(parser);
+    if (parser->has_error) return node;
+    AST_Node *then_branch = parse_statement(parser);
+    if (parser->has_error) return node;
+
+    node->if_stmt.cond = cond;
+    node->if_stmt.then_branch = then_branch;
+
+    Token *next = peek_token(parser, 0);
+    if (next->kind == TOKEN_KEYWORD && next->keyword == KEYWORD_ELSE) {
+        parser->tok_index++;
+        AST_Node *else_branch = parse_statement(parser);
+        if (parser->has_error) return node;
+        node->if_stmt.else_branch = else_branch;
+    }
+    return node;
+}
+
+static AST_Node *parse_while_statement(Parser *parser)
+{
+    AST_Node *node = make_ast_node(AST_WHILE);
+    Token *while_kw = peek_token(parser, 0);
+    node->loc = while_kw->loc;
+    parser->tok_index++; // consume 'while'
+
+    AST_Node *cond = parse_expression(parser);
+    if (parser->has_error) return node;
+    AST_Node *body = parse_statement(parser);
+    if (parser->has_error) return node;
+
+    node->while_stmt.cond = cond;
+    node->while_stmt.body = body;
+    return node;
+}
+
 static AST_Node *parse_statement(Parser *parser)
 {
     Token *tok = peek_token(parser, 0);
+    if (tok->kind == TOKEN_OPEN_BRACE) {
+        return parse_block_statement(parser);
+    }
     if (tok->kind == TOKEN_KEYWORD) {
         switch (tok->keyword) {
-            case KEYWORD_LET:  return parse_let_statement(parser);
-            case KEYWORD_SET:  return parse_set_statement(parser);
-            case KEYWORD_CALL: return parse_call_statement(parser);
+            case KEYWORD_LET:   return parse_let_statement(parser);
+            case KEYWORD_SET:   return parse_set_statement(parser);
+            case KEYWORD_CALL:  return parse_call_statement(parser);
+            case KEYWORD_IF:    return parse_if_statement(parser);
+            case KEYWORD_WHILE: return parse_while_statement(parser);
             case KEYWORD_RETURN: {
                 AST_Node *ret = make_ast_node(AST_RETURN);
                 ret->loc = tok->loc;
@@ -638,6 +801,31 @@ static void print_ast_with_indent(AST_Node *node, int depth)
             printf("%*scall-stmt %.*s\n", 2 * depth, "", PRINT_STRING(node->call.name));
             for (AST_Node *arg = node->call.args.first; arg != NULL; arg = arg->next) {
                 print_ast_with_indent(arg, depth + 1);
+            }
+        } break;
+
+        case AST_IF: {
+            printf("%*sif\n", 2 * depth, "");
+            print_ast_with_indent(node->if_stmt.cond, depth + 1);
+            printf("%*sthen\n", 2 * depth, "");
+            print_ast_with_indent(node->if_stmt.then_branch, depth + 1);
+            if (node->if_stmt.else_branch) {
+                printf("%*selse\n", 2 * depth, "");
+                print_ast_with_indent(node->if_stmt.else_branch, depth + 1);
+            }
+        } break;
+
+        case AST_WHILE: {
+            printf("%*swhile\n", 2 * depth, "");
+            print_ast_with_indent(node->while_stmt.cond, depth + 1);
+            printf("%*sdo\n", 2 * depth, "");
+            print_ast_with_indent(node->while_stmt.body, depth + 1);
+        } break;
+
+        case AST_BLOCK: {
+            printf("%*sblock\n", 2 * depth, "");
+            for (AST_Node *s = node->block.first; s != NULL; s = s->next) {
+                print_ast_with_indent(s, depth + 1);
             }
         } break;
 

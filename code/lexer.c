@@ -86,6 +86,7 @@ static const Keyword_Entry KEYWORDS[] = {
     {"let",    KEYWORD_LET},
     {"set",    KEYWORD_SET},
     {"if",     KEYWORD_IF},
+    {"else",   KEYWORD_ELSE},
     {"while",  KEYWORD_WHILE},
     {"call",   KEYWORD_CALL},
     {"return", KEYWORD_RETURN},

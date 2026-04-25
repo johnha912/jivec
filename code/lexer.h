@@ -51,6 +51,7 @@ typedef enum Keyword
     KEYWORD_LET,
     KEYWORD_SET,
     KEYWORD_IF,
+    KEYWORD_ELSE,
     KEYWORD_WHILE,
     KEYWORD_CALL,
     KEYWORD_RETURN,

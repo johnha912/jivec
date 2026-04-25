@@ -79,6 +79,7 @@ run_and_check_exit() {
 
 run_and_check_exit vars.jive 42
 run_and_check_exit fn_calls.jive 25
+run_and_check_exit fib.jive 88
 
 echo === ERROR-CASE TESTS ===
 

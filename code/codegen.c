@@ -24,6 +24,14 @@
 //     ops as locals — only the sign of the offset differs.
 //   * IR_DROP backs the operand stack up by 8 bytes and is paired with
 //     IR_CALL to implement the `call` statement, which discards the return.
+//
+// Stage 6 added comparisons (==, !=, <, <=, >, >=), logical && / ||, and
+// branching ops (LABEL / JMP / JMP_IF_FALSE) for `if` and `while`.
+// Comparisons leave a 0/1 result on the operand stack via the cmp + setCC
+// + movzx idiom. Logical AND/OR normalize each operand to 0 or 1 first so
+// non-boolean ints (e.g. 2 && 1) still produce a sensible 0/1 result.
+// Labels are emitted as NASM `.L<id>:`, which are scoped to the current
+// function thanks to NASM's local-label convention.
 
 static void generate_preamble(FILE *out_file)
 {
@@ -45,6 +53,19 @@ static void emit_binop_pop_operands(FILE *out_file)
     // Left-hand side pops second into rax.
     fprintf(out_file, "    pop rcx\n");
     fprintf(out_file, "    pop rax\n");
+}
+
+// Emit a signed integer comparison that leaves a 0/1 result on the operand
+// stack. `set_cc` is the suffix of the setCC instruction (e.g. "l" for <,
+// "le" for <=, "e" for ==).
+static void emit_compare(FILE *out_file, const char *label, const char *set_cc)
+{
+    fprintf(out_file, "\n    ; %s\n", label);
+    emit_binop_pop_operands(out_file);
+    fprintf(out_file, "    cmp rax, rcx\n");
+    fprintf(out_file, "    set%s al\n", set_cc);
+    fprintf(out_file, "    movzx rax, al\n");
+    fprintf(out_file, "    push rax\n");
 }
 
 bool generate_asm(const IR_Program *prog, FILE *out_file)
@@ -125,6 +146,54 @@ bool generate_asm(const IR_Program *prog, FILE *out_file)
                 fprintf(out_file, "    idiv rcx   ; rdx = rdx:rax %% rcx\n");
                 fprintf(out_file, "    mov rax, rdx\n");
                 fprintf(out_file, "    push rax\n");
+            } break;
+
+            case IR_EQ:  emit_compare(out_file, "EQ",  "e");   break;
+            case IR_NEQ: emit_compare(out_file, "NEQ", "ne");  break;
+            case IR_LT:  emit_compare(out_file, "LT",  "l");   break;
+            case IR_LE:  emit_compare(out_file, "LE",  "le");  break;
+            case IR_GT:  emit_compare(out_file, "GT",  "g");   break;
+            case IR_GE:  emit_compare(out_file, "GE",  "ge");  break;
+
+            case IR_AND: {
+                // Normalize each operand to 0/1 so e.g. (2 && 1) still gives 1.
+                fprintf(out_file, "\n    ; AND\n");
+                emit_binop_pop_operands(out_file);
+                fprintf(out_file, "    cmp rcx, 0\n");
+                fprintf(out_file, "    setne cl\n");
+                fprintf(out_file, "    movzx rcx, cl\n");
+                fprintf(out_file, "    cmp rax, 0\n");
+                fprintf(out_file, "    setne al\n");
+                fprintf(out_file, "    movzx rax, al\n");
+                fprintf(out_file, "    and rax, rcx\n");
+                fprintf(out_file, "    push rax\n");
+            } break;
+
+            case IR_OR: {
+                fprintf(out_file, "\n    ; OR\n");
+                emit_binop_pop_operands(out_file);
+                fprintf(out_file, "    cmp rcx, 0\n");
+                fprintf(out_file, "    setne cl\n");
+                fprintf(out_file, "    movzx rcx, cl\n");
+                fprintf(out_file, "    cmp rax, 0\n");
+                fprintf(out_file, "    setne al\n");
+                fprintf(out_file, "    movzx rax, al\n");
+                fprintf(out_file, "    or rax, rcx\n");
+                fprintf(out_file, "    push rax\n");
+            } break;
+
+            case IR_LABEL: {
+                fprintf(out_file, ".L%ld:\n", op->label_id);
+            } break;
+
+            case IR_JMP: {
+                fprintf(out_file, "    jmp .L%ld\n", op->label_id);
+            } break;
+
+            case IR_JMP_IF_FALSE: {
+                fprintf(out_file, "    pop rax\n");
+                fprintf(out_file, "    test rax, rax\n");
+                fprintf(out_file, "    jz .L%ld   ; JMP_IF_FALSE\n", op->label_id);
             } break;
 
             case IR_CALL: {
