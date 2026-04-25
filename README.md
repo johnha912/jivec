@@ -15,7 +15,7 @@ Jive is a small teaching language designed by **Professor Lothar Narins** for CS
 - [x] Stage 1 — lexer
 - [x] Stage 2 — parser + minimal codegen (empty-param `fn`s whose body is `return <int>`)
 - [x] Stage 3 — arithmetic expressions + stack-machine IR
-- [ ] Stage 4 — assemble & link the emitted NASM
+- [x] Stage 4 — local variables (`let` / `set`) + symbol table
 
 ## The Jive language
 
@@ -61,6 +61,19 @@ nasm -felf64 hello.asm -o hello.o && ld hello.o -o hello
 A `stmt` may be any single statement or a `{ ... }` block.
 
 ### Examples
+
+Local variables (compiles and runs today — the program below exits with code 42):
+
+```jive
+fn main() -> int
+{
+    let a: int = 1     // a = 1
+    let b: int = a + 5 // b = 6
+    set a = b * 2      // a = 12
+    set b = a * 3      // b = 36
+    return a + b - 6   // return 42
+}
+```
 
 Recursive Fibonacci:
 
@@ -202,10 +215,14 @@ _start:
     syscall
 
 main:
+    push rbp
+    mov rbp, rsp
     push 42   ; PUSH 42
 
     ; RETURN
     pop rax
+    mov rsp, rbp
+    pop rbp
     ret
 ```
 
@@ -253,18 +270,19 @@ Then compile it:
 
 ```
 code/
-  string.c       String type, PRINT_STRING macro, small helpers
-  lexer.h        token and public API definitions
-  lexer.c        lexer implementation
-  parser.c       AST definitions + recursive-descent parser
-  ir.c           stack-machine IR + AST→IR lowering
-  codegen.c      NASM emitter (consumes IR)
-  main.c         unity-build entry for the jive compiler
-  test_lexer.c   unity-build entry for the lexer test driver
-  build.sh       canonical build script (cd code && ./build.sh)
-jive_programs/   sample .jive input programs
-Makefile         convenience wrapper
-build/           compiled binaries and .asm output (git-ignored)
+  string.c        String type, PRINT_STRING macro, small helpers
+  lexer.h         token and public API definitions
+  lexer.c         lexer implementation
+  parser.c        AST definitions + recursive-descent parser
+  symbol_table.c  open-addressed hash table for per-function locals
+  ir.c            stack-machine IR + AST→IR lowering (uses symbol table)
+  codegen.c       NASM emitter (consumes IR)
+  main.c          unity-build entry for the jive compiler
+  test_lexer.c    unity-build entry for the lexer test driver
+  build.sh        canonical build script (cd code && ./build.sh)
+jive_programs/    sample .jive input programs
+Makefile          convenience wrapper
+build/            compiled binaries and .asm output (git-ignored)
 ```
 
 ## How the compiler works
@@ -273,7 +291,10 @@ build/           compiled binaries and .asm output (git-ignored)
 
 ```
   source.jive ──► lexer ──► tokens ──► parser ──► AST ──► ir.c ──► IR ──► codegen ──► out.asm
-  (text)                   (stream)            (tree)           (stack ops)        (NASM)
+  (text)                   (stream)            (tree)    │      (stack ops)        (NASM)
+                                                          ▼
+                                                     symbol table
+                                                  (per-function locals)
 ```
 
 **Lexer** ([code/lexer.c](code/lexer.c)). Scans the source character by character and groups characters into tokens — keywords, identifiers, numbers, strings, punctuation. Whitespace and `//` comments are dropped. Each token carries its `file:line:col` location so later stages can report errors that point back to the source.
@@ -291,12 +312,14 @@ program
       integer 42
 ```
 
-**IR generator** ([code/ir.c](code/ir.c)). Lowers each function's AST into a flat sequence of stack-machine instructions: `FN`, `END_FN`, `PUSH <n>`, `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `RETURN`. Expressions are emitted in post-order, so operands are pushed before the op that consumes them. For example, `return 2 + 3 * 4 - 5` becomes:
+**Symbol table** ([code/symbol_table.c](code/symbol_table.c)). A small open-addressed hash table mapping a variable name to a `Symbol` record (name, type, stack-slot index). Each function gets its own table, so locals don't leak between functions. The table starts at capacity 16 and doubles whenever it crosses 50% load; `symbol_table_declare` returns `NULL` when a name is already declared in the current scope, which is how `let a: int = 3 / let a: int = 5` is rejected as a redeclaration. Lookups use FNV-1a, and capacity is always a power of two so the hash maps to a slot with a single mask.
+
+**IR generator** ([code/ir.c](code/ir.c)). Lowers each function's AST into a flat sequence of stack-machine instructions: `FN`, `END_FN`, `PUSH <n>`, `LOAD_LOCAL <slot>`, `STORE_LOCAL <slot>`, `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `RETURN`. Expressions are emitted in post-order, so operands are pushed before the op that consumes them. While lowering a function, the IR generator drives a fresh symbol table — `let` calls `symbol_table_declare` and emits a `STORE_LOCAL` for any initializer, `set` looks the name up and emits a `STORE_LOCAL`, and bare identifiers in expressions become `LOAD_LOCAL`. Names that resolve to nothing (or that are declared twice) become `file:line:col: error: 'a' has not been declared` style diagnostics — the same shape the parser uses, and the driver bails out before codegen if any of them fired. For example, `return 2 + 3 * 4 - 5` becomes:
 
 ```
 $ ./build/jive jive_programs/expr.jive --dump-ir -o /dev/null
 === ir ===
-FN main
+FN main (locals=0)
 PUSH 2
 PUSH 3
 PUSH 4
@@ -309,9 +332,28 @@ END_FN
 ...
 ```
 
+A function with locals carries its slot count on `FN`, and `let`/`set`/identifier references show up as `STORE_LOCAL` and `LOAD_LOCAL` ops:
+
+```
+$ ./build/jive jive_programs/vars.jive --dump-ir -o /dev/null
+=== ir ===
+FN main (locals=2)
+PUSH 1
+STORE_LOCAL 0
+LOAD_LOCAL 0
+PUSH 5
+ADD
+STORE_LOCAL 1
+LOAD_LOCAL 1
+PUSH 2
+MUL
+STORE_LOCAL 0
+...
+```
+
 This level decouples "what to compute" from "how to emit machine code" — the IR is small, easy to read with `--dump-ir`, and pleasant to debug.
 
-**Code generator** ([code/codegen.c](code/codegen.c)). Walks the IR linearly and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then translates each IR op directly: `PUSH n` becomes `push n`, binary ops pop right-hand-side into `rcx` and left-hand-side into `rax`, compute, and re-push, and `RETURN` pops the result into `rax` before `ret`. `DIV` / `MOD` use `cqo` + `idiv` for signed 64-bit division.
+**Code generator** ([code/codegen.c](code/codegen.c)). Walks the IR linearly and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then translates each IR op directly: `PUSH n` becomes `push n`, binary ops pop right-hand-side into `rcx` and left-hand-side into `rax`, compute, and re-push. `DIV` / `MOD` use `cqo` + `idiv` for signed 64-bit division. `IR_FN` opens a function with a standard `push rbp / mov rbp, rsp / sub rsp, 8*n_locals` prologue so that local slot N lives at `[rbp - 8*(N+1)]`; `LOAD_LOCAL` becomes `push qword [rbp-…]` and `STORE_LOCAL` becomes `pop qword [rbp-…]`. `IR_RETURN` pops the result into `rax`, then `mov rsp, rbp / pop rbp / ret` tears the frame back down — even if the operand stack still holds residue.
 
 The output for `fn main() -> int { return 42 }` is:
 
@@ -325,10 +367,14 @@ _start:
     syscall
 
 main:
+    push rbp
+    mov rbp, rsp
     push 42   ; PUSH 42
 
     ; RETURN
     pop rax
+    mov rsp, rbp
+    pop rbp
     ret
 ```
 

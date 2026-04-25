@@ -34,6 +34,7 @@ typedef enum Token_Kind
     TOKEN_TILDE,          // ~
     TOKEN_BANG,           // !
 
+    TOKEN_EQ,             // =
     TOKEN_EQ_EQ,          // ==
     TOKEN_BANG_EQ,        // !=
     TOKEN_LT,             // <

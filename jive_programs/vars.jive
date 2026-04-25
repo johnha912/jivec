@@ -1,0 +1,8 @@
+fn main() -> int
+{
+    let a: int = 1     // a = 1
+    let b: int = a + 5 // b = 6
+    set a = b * 2      // a = 12
+    set b = a * 3      // b = 36
+    return a + b - 6   // return 42
+}

@@ -1,0 +1,4 @@
+fn bar() -> int
+{
+    return a + 2   // Error: a has not been declared
+}

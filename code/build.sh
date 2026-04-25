@@ -44,19 +44,48 @@ if [ $ret_val -ne 0 ]; then
 	exit $ret_val
 fi
 
-# Stage 4 will enable assembling + linking the .asm output.
-# nasm -felf64 simple.asm
-# ret_val=$?
-# if [ $ret_val -ne 0 ]; then
-# 	echo ERROR: Assembler failed to assemble simple.asm
-# 	exit $ret_val
-# fi
+echo === TEST ON VARS.JIVE ===
 
-# ld simple.o -o simple
-# ret_val=$?
-# if [ $ret_val -ne 0 ]; then
-# 	echo ERROR: Linker failed to link simple.o
-# 	exit $ret_val
-# fi
+./jive ../jive_programs/vars.jive -o vars.asm
+ret_val=$?
+if [ $ret_val -ne 0 ]; then
+	echo ERROR: Compiler returned an error compiling vars.jive
+	exit $ret_val
+fi
+
+# Stage 4 sample: assemble + link + run vars.jive and check it exits 42.
+nasm -felf64 vars.asm -o vars.o
+ret_val=$?
+if [ $ret_val -ne 0 ]; then
+	echo ERROR: Assembler failed to assemble vars.asm
+	exit $ret_val
+fi
+
+ld vars.o -o vars
+ret_val=$?
+if [ $ret_val -ne 0 ]; then
+	echo ERROR: Linker failed to link vars.o
+	exit $ret_val
+fi
+
+./vars
+ret_val=$?
+if [ $ret_val -ne 42 ]; then
+	echo "ERROR: vars exited with $ret_val (expected 42)"
+	exit 1
+fi
+echo "vars exited with 42 as expected"
+
+echo === ERROR-CASE TESTS ===
+
+# These programs are expected to fail compilation. We invert the check.
+for err_program in err_set_undeclared.jive err_use_undeclared.jive err_redeclared.jive; do
+	./jive ../jive_programs/$err_program -o /tmp/jive_err.asm 2>/dev/null
+	if [ $? -eq 0 ]; then
+		echo "ERROR: $err_program was expected to fail but compiled successfully"
+		exit 1
+	fi
+	echo "$err_program failed to compile as expected"
+done
 
 popd > /dev/null

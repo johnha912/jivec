@@ -6,6 +6,7 @@
 #include "string.c"
 #include "lexer.c"
 #include "parser.c"
+#include "symbol_table.c"
 #include "ir.c"
 #include "codegen.c"
 
@@ -83,24 +84,30 @@ int main(int arg_count, const char **args)
         print_ast(parse_result.ast);
     }
 
-    IR_Program ir = ir_from_ast(parse_result.ast);
+    IR_Result ir_result = ir_from_ast(parse_result.ast);
 
     if (options.dump_ir) {
         printf("=== ir ===\n");
-        print_ir(&ir);
+        print_ir(&ir_result.program);
+    }
+
+    if (!ir_result.success) {
+        ir_program_free(&ir_result.program);
+        token_array_free(&tokens);
+        return 1;
     }
 
     FILE *out_file = fopen(options.out_file_name, "w");
     if (!out_file) {
         fprintf(stderr, "error: could not open '%s' for writing\n", options.out_file_name);
-        ir_program_free(&ir);
+        ir_program_free(&ir_result.program);
         token_array_free(&tokens);
         return 1;
     }
 
-    bool ok = generate_asm(&ir, out_file);
+    bool ok = generate_asm(&ir_result.program, out_file);
     fclose(out_file);
-    ir_program_free(&ir);
+    ir_program_free(&ir_result.program);
     token_array_free(&tokens);
 
     return ok ? 0 : 1;

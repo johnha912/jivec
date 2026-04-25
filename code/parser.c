@@ -37,8 +37,11 @@ typedef enum AST_Kind
     AST_NONE = 0,
     AST_PROGRAM,
     AST_FN,
+    AST_LET,
+    AST_SET,
     AST_RETURN,
     AST_INTEGER,
+    AST_IDENT,
     AST_BINOP,
 } AST_Kind;
 
@@ -48,8 +51,11 @@ static const char *ast_kind_name(AST_Kind kind)
         case AST_NONE:    return "NONE";
         case AST_PROGRAM: return "PROGRAM";
         case AST_FN:      return "FN";
+        case AST_LET:     return "LET";
+        case AST_SET:     return "SET";
         case AST_RETURN:  return "RETURN";
         case AST_INTEGER: return "INTEGER";
+        case AST_IDENT:   return "IDENT";
         case AST_BINOP:   return "BINOP";
     }
     return "?";
@@ -101,6 +107,19 @@ typedef struct AST_Binop_Data
     AST_Node *right;
 } AST_Binop_Data;
 
+typedef struct AST_Let_Data
+{
+    String    name;
+    Type      type;
+    AST_Node *init;     // NULL if the declaration has no initializer
+} AST_Let_Data;
+
+typedef struct AST_Set_Data
+{
+    String    name;
+    AST_Node *value;
+} AST_Set_Data;
+
 struct AST_Node
 {
     AST_Kind kind;
@@ -112,7 +131,10 @@ struct AST_Node
         AST_Fn_Data    fn;
         AST_Node      *ret_expr;
         long           int_value;
+        String         ident_name;
         AST_Binop_Data binop;
+        AST_Let_Data   let;
+        AST_Set_Data   set;
     };
 };
 
@@ -205,6 +227,13 @@ static AST_Node *parse_primary(Parser *parser)
         parser->tok_index++;
         return node;
     }
+    if (tok->kind == TOKEN_IDENT) {
+        AST_Node *node = make_ast_node(AST_IDENT);
+        node->loc = tok->loc;
+        node->ident_name = tok->source;
+        parser->tok_index++;
+        return node;
+    }
     if (tok->kind == TOKEN_OPEN_PAREN) {
         parser->tok_index++;
         AST_Node *inner = parse_expression(parser);
@@ -285,19 +314,74 @@ static AST_Node *parse_expression(Parser *parser)
     return parse_additive(parser);
 }
 
+static AST_Node *parse_let_statement(Parser *parser)
+{
+    AST_Node *node = make_ast_node(AST_LET);
+    Token *let_kw = peek_token(parser, 0);
+    node->loc = let_kw->loc;
+    parser->tok_index++; // consume 'let'
+
+    Token *name = expect_token(parser, TOKEN_IDENT);
+    if (parser->has_error) return node;
+    node->let.name = name->source;
+
+    expect_token(parser, TOKEN_COLON);
+    if (parser->has_error) return node;
+
+    Token *type_tok = expect_token(parser, TOKEN_TYPE);
+    if (parser->has_error) return node;
+    node->let.type = type_tok->type;
+
+    Token *maybe_eq = peek_token(parser, 0);
+    if (maybe_eq->kind == TOKEN_EQ) {
+        parser->tok_index++;
+        AST_Node *init = parse_expression(parser);
+        if (parser->has_error) return node;
+        node->let.init = init;
+    }
+    return node;
+}
+
+static AST_Node *parse_set_statement(Parser *parser)
+{
+    AST_Node *node = make_ast_node(AST_SET);
+    Token *set_kw = peek_token(parser, 0);
+    node->loc = set_kw->loc;
+    parser->tok_index++; // consume 'set'
+
+    Token *name = expect_token(parser, TOKEN_IDENT);
+    if (parser->has_error) return node;
+    node->set.name = name->source;
+
+    expect_token(parser, TOKEN_EQ);
+    if (parser->has_error) return node;
+
+    AST_Node *value = parse_expression(parser);
+    if (parser->has_error) return node;
+    node->set.value = value;
+    return node;
+}
+
 static AST_Node *parse_statement(Parser *parser)
 {
     Token *tok = peek_token(parser, 0);
-    if (tok->kind == TOKEN_KEYWORD && tok->keyword == KEYWORD_RETURN) {
-        AST_Node *ret = make_ast_node(AST_RETURN);
-        ret->loc = tok->loc;
-        parser->tok_index++;
-        AST_Node *expr = parse_expression(parser);
-        if (parser->has_error) return ret;
-        ret->ret_expr = expr;
-        return ret;
+    if (tok->kind == TOKEN_KEYWORD) {
+        switch (tok->keyword) {
+            case KEYWORD_LET: return parse_let_statement(parser);
+            case KEYWORD_SET: return parse_set_statement(parser);
+            case KEYWORD_RETURN: {
+                AST_Node *ret = make_ast_node(AST_RETURN);
+                ret->loc = tok->loc;
+                parser->tok_index++;
+                AST_Node *expr = parse_expression(parser);
+                if (parser->has_error) return ret;
+                ret->ret_expr = expr;
+                return ret;
+            }
+            default: break;
+        }
     }
-    report_error_at(parser, tok->loc, "expected a statement (only 'return' is supported at this stage)");
+    report_error_at(parser, tok->loc, "expected a statement");
     return NULL;
 }
 
@@ -409,6 +493,17 @@ static void print_ast_with_indent(AST_Node *node, int depth)
             }
         } break;
 
+        case AST_LET: {
+            printf("%*slet %.*s: %s\n", 2 * depth, "",
+                   PRINT_STRING(node->let.name), type_name_cstr(node->let.type));
+            if (node->let.init) print_ast_with_indent(node->let.init, depth + 1);
+        } break;
+
+        case AST_SET: {
+            printf("%*sset %.*s\n", 2 * depth, "", PRINT_STRING(node->set.name));
+            print_ast_with_indent(node->set.value, depth + 1);
+        } break;
+
         case AST_RETURN: {
             printf("%*sreturn\n", 2 * depth, "");
             if (node->ret_expr) print_ast_with_indent(node->ret_expr, depth + 1);
@@ -416,6 +511,10 @@ static void print_ast_with_indent(AST_Node *node, int depth)
 
         case AST_INTEGER: {
             printf("%*sinteger %ld\n", 2 * depth, "", node->int_value);
+        } break;
+
+        case AST_IDENT: {
+            printf("%*sident %.*s\n", 2 * depth, "", PRINT_STRING(node->ident_name));
         } break;
 
         case AST_BINOP: {

@@ -1,0 +1,4 @@
+fn foo() -> int
+{
+    set a = 5      // Error: a has not been declared
+}

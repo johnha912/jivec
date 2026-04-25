@@ -222,7 +222,7 @@ static Token next_token(Lexer *lex)
 
         case '=':
             if (c2 == '=') { advance(lex); return make_token(TOKEN_EQ_EQ, start_loc, two); }
-            lex_error(start_loc, "unexpected '=' (did you mean '=='?)");
+            return make_token(TOKEN_EQ, start_loc, one);
 
         case '!':
             if (c2 == '=') { advance(lex); return make_token(TOKEN_BANG_EQ, start_loc, two); }
@@ -337,6 +337,7 @@ const char *token_kind_name(Token_Kind kind)
         case TOKEN_CARET:          return "^";
         case TOKEN_TILDE:          return "~";
         case TOKEN_BANG:           return "!";
+        case TOKEN_EQ:             return "=";
         case TOKEN_EQ_EQ:          return "==";
         case TOKEN_BANG_EQ:        return "!=";
         case TOKEN_LT:             return "<";
