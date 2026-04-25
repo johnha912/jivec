@@ -7,11 +7,23 @@
 // hand side into rcx and their left-hand side into rax (so the order is the
 // reverse of how they were pushed), compute the result in rax, and re-push.
 //
-// Stage 4: each function now sets up a stack frame using rbp/rsp and
-// reserves 8 bytes per declared local. Local slot N lives at [rbp - 8*(N+1)],
-// so STORE_LOCAL pops the top of the operand stack into that slot and
-// LOAD_LOCAL pushes its current value back onto the operand stack. RETURN
-// tears the frame back down before `ret`.
+// Stage 4 added local variables and a per-function rbp/rsp frame:
+//   * IR_FN reserves 8 bytes per `let`-declared local with `sub rsp`.
+//   * IR_LOAD_LOCAL / IR_STORE_LOCAL are just `push qword [rbp+off]` /
+//     `pop qword [rbp+off]` — the IR carries the signed frame offset
+//     directly so we do no arithmetic here.
+//   * IR_RETURN tears the frame back down before `ret`.
+//
+// Stage 5 added function calls. Calling convention:
+//   * Caller evaluates each argument and leaves it on the operand stack.
+//   * IR_CALL emits `call name`, then `add rsp, 8*n_args` to drop the
+//     arguments, then `push rax` so the callee's return value becomes the
+//     new top operand.
+//   * Parameters live in the caller's frame at positive rbp offsets, so the
+//     callee accesses them through the same IR_LOAD_LOCAL / IR_STORE_LOCAL
+//     ops as locals — only the sign of the offset differs.
+//   * IR_DROP backs the operand stack up by 8 bytes and is paired with
+//     IR_CALL to implement the `call` statement, which discards the return.
 
 static void generate_preamble(FILE *out_file)
 {
@@ -33,12 +45,6 @@ static void emit_binop_pop_operands(FILE *out_file)
     // Left-hand side pops second into rax.
     fprintf(out_file, "    pop rcx\n");
     fprintf(out_file, "    pop rax\n");
-}
-
-static long local_offset_from_rbp(long slot)
-{
-    // Slot 0 is the first local declared, and lives just below the saved rbp.
-    return 8 * (slot + 1);
 }
 
 bool generate_asm(const IR_Program *prog, FILE *out_file)
@@ -70,13 +76,15 @@ bool generate_asm(const IR_Program *prog, FILE *out_file)
             } break;
 
             case IR_LOAD_LOCAL: {
-                fprintf(out_file, "    push qword [rbp-%ld]   ; LOAD_LOCAL %ld\n",
-                        local_offset_from_rbp(op->slot), op->slot);
+                // %+ld renders the sign explicitly (e.g. -8 or +24), so the
+                // emitted address `[rbp-8]` / `[rbp+24]` is unambiguous.
+                fprintf(out_file, "    push qword [rbp%+ld]   ; LOAD_LOCAL\n",
+                        op->frame_offset);
             } break;
 
             case IR_STORE_LOCAL: {
-                fprintf(out_file, "    pop qword [rbp-%ld]    ; STORE_LOCAL %ld\n",
-                        local_offset_from_rbp(op->slot), op->slot);
+                fprintf(out_file, "    pop qword [rbp%+ld]    ; STORE_LOCAL\n",
+                        op->frame_offset);
             } break;
 
             case IR_ADD: {
@@ -117,6 +125,21 @@ bool generate_asm(const IR_Program *prog, FILE *out_file)
                 fprintf(out_file, "    idiv rcx   ; rdx = rdx:rax %% rcx\n");
                 fprintf(out_file, "    mov rax, rdx\n");
                 fprintf(out_file, "    push rax\n");
+            } break;
+
+            case IR_CALL: {
+                fprintf(out_file, "\n    ; CALL %.*s (%ld arg(s))\n",
+                        PRINT_STRING(op->call.name), op->call.n_args);
+                fprintf(out_file, "    call %.*s\n", PRINT_STRING(op->call.name));
+                if (op->call.n_args > 0) {
+                    fprintf(out_file, "    add rsp, %ld   ; drop %ld arg(s)\n",
+                            8 * op->call.n_args, op->call.n_args);
+                }
+                fprintf(out_file, "    push rax   ; return value\n");
+            } break;
+
+            case IR_DROP: {
+                fprintf(out_file, "    add rsp, 8   ; DROP\n");
             } break;
 
             case IR_RETURN: {

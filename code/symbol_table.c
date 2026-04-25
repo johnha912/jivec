@@ -8,27 +8,32 @@
 
 // Hash table mapping a variable name (String) to its compile-time info.
 // Each function gets its own Symbol_Table; the IR generator uses it to
-// resolve `let` declarations into stack slots and to reject `set` /
-// identifier references that name a variable nothing has declared yet.
+// resolve `let` declarations into stack slots, bind parameters to their
+// caller-supplied slots, and reject any `set` or identifier reference
+// that names a variable nothing has declared yet.
 //
 // Open addressing with linear probing. The table grows (doubles) once it
 // reaches 50% load so probes stay short. Capacity is always a power of two
 // so we can mask the hash with (capacity - 1) instead of dividing.
+//
+// Each symbol records its rbp-relative byte offset:
+//   * locals (`let`)  → negative offset (below the saved rbp)
+//   * parameters      → positive offset (above the saved rbp + return addr)
 
 typedef struct Symbol
 {
     bool   occupied;
     String name;
     Type   type;
-    long   slot;     // index into the function's local-variable area
+    long   frame_offset;   // signed bytes from rbp
 } Symbol;
 
 typedef struct Symbol_Table
 {
     Symbol *items;
-    long    count;       // number of occupied slots
-    long    capacity;    // total number of slots (power of two)
-    long    next_slot;   // next free local-variable index to hand out
+    long    count;
+    long    capacity;
+    long    n_locals;      // number of `let`-declared locals so far
 } Symbol_Table;
 
 // FNV-1a 64-bit. Good enough for short identifier strings.
@@ -74,7 +79,7 @@ static void symbol_table_init(Symbol_Table *table)
     table->items = NULL;
     table->count = 0;
     table->capacity = 0;
-    table->next_slot = 0;
+    table->n_locals = 0;
     symbol_table_grow(table, 16);
 }
 
@@ -84,7 +89,7 @@ static void symbol_table_free(Symbol_Table *table)
     table->items = NULL;
     table->count = 0;
     table->capacity = 0;
-    table->next_slot = 0;
+    table->n_locals = 0;
 }
 
 static Symbol *symbol_table_lookup(Symbol_Table *table, String name)
@@ -121,10 +126,9 @@ static Symbol *symbol_table_insert_raw(Symbol_Table *table, Symbol sym)
     }
 }
 
-// Declare a brand-new local. Returns NULL if `name` is already declared in
-// this table (caller reports the redeclaration error). Otherwise allocates
-// a fresh stack slot and returns the inserted entry.
-static Symbol *symbol_table_declare(Symbol_Table *table, String name, Type type)
+// Generic declare. Returns NULL if a symbol with this name already exists,
+// so the caller can report the redeclaration with a precise location.
+static Symbol *symbol_table_declare(Symbol_Table *table, String name, Type type, long frame_offset)
 {
     if (symbol_table_lookup(table, name)) return NULL;
 
@@ -136,8 +140,29 @@ static Symbol *symbol_table_declare(Symbol_Table *table, String name, Type type)
     Symbol sym = {0};
     sym.name = name;
     sym.type = type;
-    sym.slot = table->next_slot++;
+    sym.frame_offset = frame_offset;
     return symbol_table_insert_raw(table, sym);
+}
+
+// Each `let` lives 8 bytes deeper in the local-variable area. Offsets are
+// negative because locals sit below the saved rbp.
+static Symbol *symbol_table_declare_local(Symbol_Table *table, String name, Type type)
+{
+    long offset = -8 * (table->n_locals + 1);
+    Symbol *sym = symbol_table_declare(table, name, type, offset);
+    if (sym) table->n_locals++;
+    return sym;
+}
+
+// Parameters live in the caller's frame, above the saved rbp + return addr.
+// Args are pushed left-to-right at the call site, so the first-declared param
+// (lowest index) sits deepest in the stack and last-declared (highest index)
+// sits at [rbp+16].
+static Symbol *symbol_table_declare_param(Symbol_Table *table, String name, Type type,
+                                          long param_index, long n_params)
+{
+    long offset = 8 + 8 * (n_params - param_index);
+    return symbol_table_declare(table, name, type, offset);
 }
 
 #endif

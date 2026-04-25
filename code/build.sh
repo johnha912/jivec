@@ -44,37 +44,41 @@ if [ $ret_val -ne 0 ]; then
 	exit $ret_val
 fi
 
-echo === TEST ON VARS.JIVE ===
+# Helper: compile a .jive program, assemble + link, run it, and assert the
+# exit code matches the expected value.
+run_and_check_exit() {
+	local program=$1
+	local expected=$2
+	local stem=${program%.jive}
 
-./jive ../jive_programs/vars.jive -o vars.asm
-ret_val=$?
-if [ $ret_val -ne 0 ]; then
-	echo ERROR: Compiler returned an error compiling vars.jive
-	exit $ret_val
-fi
+	echo === TEST ON ${program^^} ===
 
-# Stage 4 sample: assemble + link + run vars.jive and check it exits 42.
-nasm -felf64 vars.asm -o vars.o
-ret_val=$?
-if [ $ret_val -ne 0 ]; then
-	echo ERROR: Assembler failed to assemble vars.asm
-	exit $ret_val
-fi
+	./jive ../jive_programs/$program -o $stem.asm
+	if [ $? -ne 0 ]; then
+		echo "ERROR: compiler failed on $program"
+		exit 1
+	fi
+	nasm -felf64 $stem.asm -o $stem.o
+	if [ $? -ne 0 ]; then
+		echo "ERROR: nasm failed on $stem.asm"
+		exit 1
+	fi
+	ld $stem.o -o $stem
+	if [ $? -ne 0 ]; then
+		echo "ERROR: ld failed on $stem.o"
+		exit 1
+	fi
+	./$stem
+	local actual=$?
+	if [ $actual -ne $expected ]; then
+		echo "ERROR: $stem exited with $actual (expected $expected)"
+		exit 1
+	fi
+	echo "$stem exited with $expected as expected"
+}
 
-ld vars.o -o vars
-ret_val=$?
-if [ $ret_val -ne 0 ]; then
-	echo ERROR: Linker failed to link vars.o
-	exit $ret_val
-fi
-
-./vars
-ret_val=$?
-if [ $ret_val -ne 42 ]; then
-	echo "ERROR: vars exited with $ret_val (expected 42)"
-	exit 1
-fi
-echo "vars exited with 42 as expected"
+run_and_check_exit vars.jive 42
+run_and_check_exit fn_calls.jive 25
 
 echo === ERROR-CASE TESTS ===
 

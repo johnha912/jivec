@@ -37,26 +37,32 @@ typedef enum AST_Kind
     AST_NONE = 0,
     AST_PROGRAM,
     AST_FN,
+    AST_PARAM,
     AST_LET,
     AST_SET,
     AST_RETURN,
     AST_INTEGER,
     AST_IDENT,
     AST_BINOP,
+    AST_CALL,         // function call used as an expression (return value kept)
+    AST_CALL_STMT,    // `call` statement (return value discarded)
 } AST_Kind;
 
 static const char *ast_kind_name(AST_Kind kind)
 {
     switch (kind) {
-        case AST_NONE:    return "NONE";
-        case AST_PROGRAM: return "PROGRAM";
-        case AST_FN:      return "FN";
-        case AST_LET:     return "LET";
-        case AST_SET:     return "SET";
-        case AST_RETURN:  return "RETURN";
-        case AST_INTEGER: return "INTEGER";
-        case AST_IDENT:   return "IDENT";
-        case AST_BINOP:   return "BINOP";
+        case AST_NONE:      return "NONE";
+        case AST_PROGRAM:   return "PROGRAM";
+        case AST_FN:        return "FN";
+        case AST_PARAM:     return "PARAM";
+        case AST_LET:       return "LET";
+        case AST_SET:       return "SET";
+        case AST_RETURN:    return "RETURN";
+        case AST_INTEGER:   return "INTEGER";
+        case AST_IDENT:     return "IDENT";
+        case AST_BINOP:     return "BINOP";
+        case AST_CALL:      return "CALL";
+        case AST_CALL_STMT: return "CALL_STMT";
     }
     return "?";
 }
@@ -120,6 +126,18 @@ typedef struct AST_Set_Data
     AST_Node *value;
 } AST_Set_Data;
 
+typedef struct AST_Param_Data
+{
+    String name;
+    Type   type;
+} AST_Param_Data;
+
+typedef struct AST_Call_Data
+{
+    String   name;
+    AST_List args;     // each arg is an expression AST_Node
+} AST_Call_Data;
+
 struct AST_Node
 {
     AST_Kind kind;
@@ -129,12 +147,14 @@ struct AST_Node
     union {
         AST_List       program;
         AST_Fn_Data    fn;
+        AST_Param_Data param;
         AST_Node      *ret_expr;
         long           int_value;
         String         ident_name;
         AST_Binop_Data binop;
         AST_Let_Data   let;
         AST_Set_Data   set;
+        AST_Call_Data  call;
     };
 };
 
@@ -217,6 +237,27 @@ static Token *expect_keyword(Parser *parser, Keyword expected_kw)
 
 static AST_Node *parse_expression(Parser *parser);
 
+// Parse a comma-separated list of expressions inside an already-consumed '('
+// up to (but not including) the matching ')'. Appends each parsed expression
+// to `args`. Returns with the closing ')' still on the token stream so the
+// caller can consume it (and report a useful error if it's missing).
+static void parse_argument_list(Parser *parser, AST_List *args)
+{
+    Token *first = peek_token(parser, 0);
+    if (first->kind == TOKEN_CLOSE_PAREN) return;
+
+    AST_Node *arg = parse_expression(parser);
+    if (parser->has_error) return;
+    ast_list_append(args, arg);
+
+    while (peek_token(parser, 0)->kind == TOKEN_COMMA) {
+        parser->tok_index++;
+        AST_Node *next_arg = parse_expression(parser);
+        if (parser->has_error) return;
+        ast_list_append(args, next_arg);
+    }
+}
+
 static AST_Node *parse_primary(Parser *parser)
 {
     Token *tok = peek_token(parser, 0);
@@ -228,6 +269,18 @@ static AST_Node *parse_primary(Parser *parser)
         return node;
     }
     if (tok->kind == TOKEN_IDENT) {
+        Token *next = peek_token(parser, 1);
+        if (next->kind == TOKEN_OPEN_PAREN) {
+            // Call expression: ident '(' [ args ] ')'
+            AST_Node *node = make_ast_node(AST_CALL);
+            node->loc = tok->loc;
+            node->call.name = tok->source;
+            parser->tok_index += 2; // consume name and '('
+            parse_argument_list(parser, &node->call.args);
+            if (parser->has_error) return node;
+            expect_token(parser, TOKEN_CLOSE_PAREN);
+            return node;
+        }
         AST_Node *node = make_ast_node(AST_IDENT);
         node->loc = tok->loc;
         node->ident_name = tok->source;
@@ -362,13 +415,33 @@ static AST_Node *parse_set_statement(Parser *parser)
     return node;
 }
 
+static AST_Node *parse_call_statement(Parser *parser)
+{
+    AST_Node *node = make_ast_node(AST_CALL_STMT);
+    Token *call_kw = peek_token(parser, 0);
+    node->loc = call_kw->loc;
+    parser->tok_index++; // consume 'call'
+
+    Token *name = expect_token(parser, TOKEN_IDENT);
+    if (parser->has_error) return node;
+    node->call.name = name->source;
+
+    expect_token(parser, TOKEN_OPEN_PAREN);
+    if (parser->has_error) return node;
+    parse_argument_list(parser, &node->call.args);
+    if (parser->has_error) return node;
+    expect_token(parser, TOKEN_CLOSE_PAREN);
+    return node;
+}
+
 static AST_Node *parse_statement(Parser *parser)
 {
     Token *tok = peek_token(parser, 0);
     if (tok->kind == TOKEN_KEYWORD) {
         switch (tok->keyword) {
-            case KEYWORD_LET: return parse_let_statement(parser);
-            case KEYWORD_SET: return parse_set_statement(parser);
+            case KEYWORD_LET:  return parse_let_statement(parser);
+            case KEYWORD_SET:  return parse_set_statement(parser);
+            case KEYWORD_CALL: return parse_call_statement(parser);
             case KEYWORD_RETURN: {
                 AST_Node *ret = make_ast_node(AST_RETURN);
                 ret->loc = tok->loc;
@@ -425,7 +498,30 @@ static AST_Node *parse_fn_def(Parser *parser)
     expect_token(parser, TOKEN_OPEN_PAREN);
     if (parser->has_error) return result;
 
-    // Parameters are not supported yet; any token other than ')' is an error.
+    // Parameter list: identifier ":" type, comma-separated, possibly empty.
+    Token *peek_after_open = peek_token(parser, 0);
+    if (peek_after_open->kind != TOKEN_CLOSE_PAREN) {
+        for (;;) {
+            AST_Node *param = make_ast_node(AST_PARAM);
+            Token *param_name = expect_token(parser, TOKEN_IDENT);
+            if (parser->has_error) return result;
+            param->loc = param_name->loc;
+            param->param.name = param_name->source;
+
+            expect_token(parser, TOKEN_COLON);
+            if (parser->has_error) return result;
+
+            Token *param_type = expect_token(parser, TOKEN_TYPE);
+            if (parser->has_error) return result;
+            param->param.type = param_type->type;
+
+            ast_list_append(&result->fn.parameters, param);
+
+            Token *next = peek_token(parser, 0);
+            if (next->kind != TOKEN_COMMA) break;
+            parser->tok_index++; // consume comma, expect another param
+        }
+    }
     expect_token(parser, TOKEN_CLOSE_PAREN);
     if (parser->has_error) return result;
 
@@ -483,7 +579,15 @@ static void print_ast_with_indent(AST_Node *node, int depth)
         } break;
 
         case AST_FN: {
-            printf("%*sfn %.*s()", 2 * depth, "", PRINT_STRING(node->fn.name));
+            printf("%*sfn %.*s(", 2 * depth, "", PRINT_STRING(node->fn.name));
+            int first = 1;
+            for (AST_Node *p = node->fn.parameters.first; p != NULL; p = p->next) {
+                if (!first) printf(", ");
+                first = 0;
+                printf("%.*s: %s",
+                       PRINT_STRING(p->param.name), type_name_cstr(p->param.type));
+            }
+            printf(")");
             if (node->fn.has_return_type) {
                 printf(" -> %s", type_name_cstr(node->fn.return_type));
             }
@@ -521,6 +625,20 @@ static void print_ast_with_indent(AST_Node *node, int depth)
             printf("%*sbinop %s\n", 2 * depth, "", binop_symbol(node->binop.op));
             print_ast_with_indent(node->binop.left,  depth + 1);
             print_ast_with_indent(node->binop.right, depth + 1);
+        } break;
+
+        case AST_CALL: {
+            printf("%*scall %.*s\n", 2 * depth, "", PRINT_STRING(node->call.name));
+            for (AST_Node *arg = node->call.args.first; arg != NULL; arg = arg->next) {
+                print_ast_with_indent(arg, depth + 1);
+            }
+        } break;
+
+        case AST_CALL_STMT: {
+            printf("%*scall-stmt %.*s\n", 2 * depth, "", PRINT_STRING(node->call.name));
+            for (AST_Node *arg = node->call.args.first; arg != NULL; arg = arg->next) {
+                print_ast_with_indent(arg, depth + 1);
+            }
         } break;
 
         default: {

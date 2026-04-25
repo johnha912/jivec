@@ -4,14 +4,20 @@
 
 // Stack-machine intermediate representation. Sits between the AST (built by
 // parser.c) and the x86-64 emitter (codegen.c). Every expression is lowered
-// to a post-order sequence of PUSHes and binary ops; the runtime stack
-// holds operand values while a function is executing.
+// to a post-order sequence of PUSHes, binary ops, and (since stage 5) calls.
+// The runtime stack holds operand values while a function is executing.
 //
-// Stage 4 added local variables. Each function carries its own
-// Symbol_Table, which assigns a stack slot to every `let`-declared name.
-// Identifier references and `set` statements are checked against that
-// table — undeclared or redeclared names raise a semantic error here,
-// before any assembly is emitted.
+// Variable model. Each function carries its own Symbol_Table. Locals (`let`)
+// live below the saved rbp at negative byte offsets; parameters live above
+// the saved rbp + return address at positive offsets. The IR records the
+// signed frame offset directly on every LOAD/STORE, so codegen just emits
+// `[rbp + offset]` without further calculation.
+//
+// Calling convention. Caller evaluates arguments left-to-right, pushing each
+// onto the operand stack. IR_CALL emits the actual `call`, then cleans up
+// the n_args words and pushes the callee's return value (rax) back as a new
+// operand. The matching `call` statement is `IR_CALL` followed by `IR_DROP`,
+// which discards the unwanted return value.
 
 typedef enum IR_Op_Kind
 {
@@ -25,6 +31,8 @@ typedef enum IR_Op_Kind
     IR_MUL,
     IR_DIV,
     IR_MOD,
+    IR_CALL,
+    IR_DROP,
     IR_RETURN,
 } IR_Op_Kind;
 
@@ -33,11 +41,15 @@ typedef struct IR_Op
     IR_Op_Kind kind;
     union {
         long push_value;
-        long slot;
+        long frame_offset;       // for IR_LOAD_LOCAL / IR_STORE_LOCAL
         struct {
             String name;
-            long   n_locals;   // valid only on IR_FN; backpatched after the body
+            long   n_locals;     // valid only on IR_FN; backpatched after the body
         } fn;
+        struct {
+            String name;
+            long   n_args;
+        } call;
     };
 } IR_Op;
 
@@ -74,6 +86,8 @@ static const char *ir_op_kind_name(IR_Op_Kind kind)
         case IR_MUL:          return "MUL";
         case IR_DIV:          return "DIV";
         case IR_MOD:          return "MOD";
+        case IR_CALL:         return "CALL";
+        case IR_DROP:         return "DROP";
         case IR_RETURN:       return "RETURN";
     }
     return "?";
@@ -109,6 +123,19 @@ static IR_Op_Kind ir_op_for_binop(Binary_Op op)
     return IR_ADD;
 }
 
+static void emit_expression(IR_Builder *builder, AST_Node *expr);
+
+// Walk the call's argument list, lowering each argument expression in turn.
+// After this returns, exactly `args.count` operands sit on the operand stack
+// and an IR_CALL with the matching n_args will balance back to one value.
+static void emit_call_args(IR_Builder *builder, AST_List args)
+{
+    for (AST_Node *arg = args.first; arg != NULL; arg = arg->next) {
+        emit_expression(builder, arg);
+        if (builder->has_error) return;
+    }
+}
+
 static void emit_expression(IR_Builder *builder, AST_Node *expr)
 {
     switch (expr->kind) {
@@ -131,7 +158,7 @@ static void emit_expression(IR_Builder *builder, AST_Node *expr)
             }
             IR_Op op = {0};
             op.kind = IR_LOAD_LOCAL;
-            op.slot = sym->slot;
+            op.frame_offset = sym->frame_offset;
             ir_program_append(builder->prog, op);
         } break;
 
@@ -140,6 +167,16 @@ static void emit_expression(IR_Builder *builder, AST_Node *expr)
             emit_expression(builder, expr->binop.right);
             IR_Op op = {0};
             op.kind = ir_op_for_binop(expr->binop.op);
+            ir_program_append(builder->prog, op);
+        } break;
+
+        case AST_CALL: {
+            emit_call_args(builder, expr->call.args);
+            if (builder->has_error) return;
+            IR_Op op = {0};
+            op.kind = IR_CALL;
+            op.call.name = expr->call.name;
+            op.call.n_args = expr->call.args.count;
             ir_program_append(builder->prog, op);
         } break;
 
@@ -157,8 +194,8 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
         case AST_LET: {
             // Reserve the slot first so the initializer can reference earlier
             // variables, then run the initializer and pop into the new slot.
-            Symbol *sym = symbol_table_declare(builder->symbols,
-                                               stmt->let.name, stmt->let.type);
+            Symbol *sym = symbol_table_declare_local(builder->symbols,
+                                                     stmt->let.name, stmt->let.type);
             if (!sym) {
                 char msg[256];
                 snprintf(msg, sizeof(msg),
@@ -172,7 +209,7 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
                 if (builder->has_error) return;
                 IR_Op op = {0};
                 op.kind = IR_STORE_LOCAL;
-                op.slot = sym->slot;
+                op.frame_offset = sym->frame_offset;
                 ir_program_append(builder->prog, op);
             }
         } break;
@@ -191,8 +228,24 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
             if (builder->has_error) return;
             IR_Op op = {0};
             op.kind = IR_STORE_LOCAL;
-            op.slot = sym->slot;
+            op.frame_offset = sym->frame_offset;
             ir_program_append(builder->prog, op);
+        } break;
+
+        case AST_CALL_STMT: {
+            // A `call` statement is just an IR_CALL whose return value we
+            // immediately discard so the operand stack stays balanced.
+            emit_call_args(builder, stmt->call.args);
+            if (builder->has_error) return;
+            IR_Op call_op = {0};
+            call_op.kind = IR_CALL;
+            call_op.call.name = stmt->call.name;
+            call_op.call.n_args = stmt->call.args.count;
+            ir_program_append(builder->prog, call_op);
+
+            IR_Op drop_op = {0};
+            drop_op.kind = IR_DROP;
+            ir_program_append(builder->prog, drop_op);
         } break;
 
         case AST_RETURN: {
@@ -214,8 +267,9 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
 static void emit_function(IR_Builder *builder, AST_Node *fn_node)
 {
     // Each function gets a fresh symbol table so locals don't leak between
-    // functions. We emit IR_FN immediately and patch its `n_locals` field
-    // once the body has been lowered and we know the final slot count.
+    // functions. Parameters are declared first (they live in the caller's
+    // frame), then locals get assigned slots as `let` statements appear in
+    // the body. We patch IR_FN's `n_locals` once the body is lowered.
     Symbol_Table table = {0};
     symbol_table_init(&table);
 
@@ -229,13 +283,28 @@ static void emit_function(IR_Builder *builder, AST_Node *fn_node)
     Symbol_Table *prev_symbols = builder->symbols;
     builder->symbols = &table;
 
+    long n_params = fn_node->fn.parameters.count;
+    long param_index = 0;
+    for (AST_Node *p = fn_node->fn.parameters.first; p != NULL; p = p->next) {
+        Symbol *sym = symbol_table_declare_param(&table, p->param.name, p->param.type,
+                                                 param_index, n_params);
+        if (!sym) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "parameter '%.*s' has already been declared in this scope",
+                     PRINT_STRING(p->param.name));
+            ir_report_error(builder, p->loc, msg);
+        }
+        param_index++;
+    }
+
     for (AST_Node *stmt = fn_node->fn.body.first; stmt != NULL; stmt = stmt->next) {
         emit_statement(builder, stmt);
-        // Keep going on error so that we can report multiple problems per
+        // Keep going on error so multiple problems can be reported per
         // function; the driver bails out before codegen if has_error is set.
     }
 
-    builder->prog->items[fn_op_index].fn.n_locals = table.next_slot;
+    builder->prog->items[fn_op_index].fn.n_locals = table.n_locals;
 
     builder->symbols = prev_symbols;
     symbol_table_free(&table);
@@ -289,10 +358,14 @@ void print_ir(const IR_Program *prog)
                 printf("PUSH %ld\n", op->push_value);
                 break;
             case IR_LOAD_LOCAL:
-                printf("LOAD_LOCAL %ld\n", op->slot);
+                printf("LOAD_LOCAL [rbp%+ld]\n", op->frame_offset);
                 break;
             case IR_STORE_LOCAL:
-                printf("STORE_LOCAL %ld\n", op->slot);
+                printf("STORE_LOCAL [rbp%+ld]\n", op->frame_offset);
+                break;
+            case IR_CALL:
+                printf("CALL %.*s (args=%ld)\n",
+                       PRINT_STRING(op->call.name), op->call.n_args);
                 break;
             default:
                 printf("%s\n", ir_op_kind_name(op->kind));

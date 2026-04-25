@@ -16,6 +16,7 @@ Jive is a small teaching language designed by **Professor Lothar Narins** for CS
 - [x] Stage 2 — parser + minimal codegen (empty-param `fn`s whose body is `return <int>`)
 - [x] Stage 3 — arithmetic expressions + stack-machine IR
 - [x] Stage 4 — local variables (`let` / `set`) + symbol table
+- [x] Stage 5 — function calls, arguments, and parameters
 
 ## The Jive language
 
@@ -72,6 +73,25 @@ fn main() -> int
     set a = b * 2      // a = 12
     set b = a * 3      // b = 36
     return a + b - 6   // return 42
+}
+```
+
+Function calls with parameters (compiles and runs today — exits with code 25):
+
+```jive
+fn square(x: int) -> int
+{
+    return x * x
+}
+
+fn len_sq(x: int, y: int) -> int
+{
+    return square(x) + square(y)
+}
+
+fn main() -> int
+{
+    return len_sq(3, 4)   // 9 + 16 = 25
 }
 ```
 
@@ -318,9 +338,9 @@ program
       integer 42
 ```
 
-**Symbol table** ([code/symbol_table.c](code/symbol_table.c)). A small open-addressed hash table mapping a variable name to a `Symbol` record (name, type, stack-slot index). Each function gets its own table, so locals don't leak between functions. The table starts at capacity 16 and doubles whenever it crosses 50% load; `symbol_table_declare` returns `NULL` when a name is already declared in the current scope, which is how `let a: int = 3 / let a: int = 5` is rejected as a redeclaration. Lookups use FNV-1a, and capacity is always a power of two so the hash maps to a slot with a single mask.
+**Symbol table** ([code/symbol_table.c](code/symbol_table.c)). A small open-addressed hash table mapping a variable name to a `Symbol` record (name, type, signed rbp-relative byte offset). Each function gets its own table, so names don't leak between functions. Two helpers `symbol_table_declare_local` and `symbol_table_declare_param` lay variables out in the right place: locals live below the saved rbp at negative offsets `[rbp-8]`, `[rbp-16]`, ..., and parameters live above the saved rbp + return address at positive offsets — first-declared param sits deepest, last-declared sits at `[rbp+16]`. The table starts at capacity 16 and doubles whenever it crosses 50% load; declaring a name that already exists returns `NULL` so the IR generator can report `let a: int = 3 / let a: int = 5` (or `fn f(x: int, x: int)`) as a redeclaration. Lookups use FNV-1a, and capacity is always a power of two so the hash maps to a slot with a single mask.
 
-**IR generator** ([code/ir.c](code/ir.c)). Lowers each function's AST into a flat sequence of stack-machine instructions: `FN`, `END_FN`, `PUSH <n>`, `LOAD_LOCAL <slot>`, `STORE_LOCAL <slot>`, `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `RETURN`. Expressions are emitted in post-order, so operands are pushed before the op that consumes them. While lowering a function, the IR generator drives a fresh symbol table — `let` calls `symbol_table_declare` and emits a `STORE_LOCAL` for any initializer, `set` looks the name up and emits a `STORE_LOCAL`, and bare identifiers in expressions become `LOAD_LOCAL`. Names that resolve to nothing (or that are declared twice) become `file:line:col: error: 'a' has not been declared` style diagnostics — the same shape the parser uses, and the driver bails out before codegen if any of them fired. For example, `return 2 + 3 * 4 - 5` becomes:
+**IR generator** ([code/ir.c](code/ir.c)). Lowers each function's AST into a flat sequence of stack-machine instructions: `FN`, `END_FN`, `PUSH <n>`, `LOAD_LOCAL [rbp+off]`, `STORE_LOCAL [rbp+off]`, `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `CALL <name> (args=N)`, `DROP`, `RETURN`. Expressions are emitted in post-order, so operands are pushed before the op that consumes them. While lowering a function, the IR generator drives a fresh symbol table — parameters are declared up front (so the body can read them), then `let` calls `symbol_table_declare_local` and emits a `STORE_LOCAL` for any initializer, `set` looks the name up and emits a `STORE_LOCAL`, and bare identifiers in expressions become `LOAD_LOCAL` against the bound symbol's frame offset (negative for locals, positive for params — same op either way). Function calls are lowered argument-by-argument with the same expression machinery and a single `CALL` op that knows how many arguments to clean up; the `call` statement is just a `CALL` followed by `DROP` to throw away the return value. Names that resolve to nothing (or that are declared twice) become `file:line:col: error: 'a' has not been declared` style diagnostics — the same shape the parser uses, and the driver bails out before codegen if any of them fired. For example, `return 2 + 3 * 4 - 5` becomes:
 
 ```
 $ ./build/jive jive_programs/expr.jive --dump-ir -o /dev/null
@@ -338,28 +358,55 @@ END_FN
 ...
 ```
 
-A function with locals carries its slot count on `FN`, and `let`/`set`/identifier references show up as `STORE_LOCAL` and `LOAD_LOCAL` ops:
+A function with locals carries its slot count on `FN`, and `let`/`set`/identifier references show up as `STORE_LOCAL` and `LOAD_LOCAL` ops carrying the variable's signed rbp-relative offset:
 
 ```
 $ ./build/jive jive_programs/vars.jive --dump-ir -o /dev/null
 === ir ===
 FN main (locals=2)
 PUSH 1
-STORE_LOCAL 0
-LOAD_LOCAL 0
+STORE_LOCAL [rbp-8]
+LOAD_LOCAL [rbp-8]
 PUSH 5
 ADD
-STORE_LOCAL 1
-LOAD_LOCAL 1
+STORE_LOCAL [rbp-16]
+LOAD_LOCAL [rbp-16]
 PUSH 2
 MUL
-STORE_LOCAL 0
+STORE_LOCAL [rbp-8]
 ...
+```
+
+Parameters use the same `LOAD_LOCAL` / `STORE_LOCAL` ops, but their offset is positive because they live in the caller's frame:
+
+```
+$ ./build/jive jive_programs/fn_calls.jive --dump-ir -o /dev/null
+=== ir ===
+FN square (locals=0)
+LOAD_LOCAL [rbp+16]
+LOAD_LOCAL [rbp+16]
+MUL
+RETURN
+END_FN
+FN len_sq (locals=0)
+LOAD_LOCAL [rbp+24]
+CALL square (args=1)
+LOAD_LOCAL [rbp+16]
+CALL square (args=1)
+ADD
+RETURN
+END_FN
+FN main (locals=0)
+PUSH 3
+PUSH 4
+CALL len_sq (args=2)
+RETURN
+END_FN
 ```
 
 This level decouples "what to compute" from "how to emit machine code" — the IR is small, easy to read with `--dump-ir`, and pleasant to debug.
 
-**Code generator** ([code/codegen.c](code/codegen.c)). Walks the IR linearly and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then translates each IR op directly: `PUSH n` becomes `push n`, binary ops pop right-hand-side into `rcx` and left-hand-side into `rax`, compute, and re-push. `DIV` / `MOD` use `cqo` + `idiv` for signed 64-bit division. `IR_FN` opens a function with a standard `push rbp / mov rbp, rsp / sub rsp, 8*n_locals` prologue so that local slot N lives at `[rbp - 8*(N+1)]`; `LOAD_LOCAL` becomes `push qword [rbp-…]` and `STORE_LOCAL` becomes `pop qword [rbp-…]`. `IR_RETURN` pops the result into `rax`, then `mov rsp, rbp / pop rbp / ret` tears the frame back down — even if the operand stack still holds residue.
+**Code generator** ([code/codegen.c](code/codegen.c)). Walks the IR linearly and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then translates each IR op directly: `PUSH n` becomes `push n`, binary ops pop right-hand-side into `rcx` and left-hand-side into `rax`, compute, and re-push. `DIV` / `MOD` use `cqo` + `idiv` for signed 64-bit division. `IR_FN` opens a function with a standard `push rbp / mov rbp, rsp / sub rsp, 8*n_locals` prologue; `LOAD_LOCAL` becomes `push qword [rbp+off]` and `STORE_LOCAL` becomes `pop qword [rbp+off]`, where `off` is the signed offset the IR carries (negative for locals, positive for parameters — codegen does no arithmetic). `IR_CALL` emits `call name`, then `add rsp, 8*n_args` to drop the arguments the caller pushed, then `push rax` so the callee's return value becomes the new top operand. `IR_DROP` is a single `add rsp, 8` and pairs with `CALL` to implement `call` statements that ignore the return value. `IR_RETURN` pops the result into `rax`, then `mov rsp, rbp / pop rbp / ret` tears the frame back down — even if the operand stack still holds residue.
 
 The output for `fn main() -> int { return 42 }` is:
 

@@ -1,0 +1,14 @@
+fn square(x: int) -> int
+{
+    return x * x
+}
+
+fn len_sq(x: int, y: int) -> int
+{
+    return square(x) + square(y)
+}
+
+fn main() -> int
+{
+    return len_sq(3, 4)   // 9 + 16 = 25
+}
