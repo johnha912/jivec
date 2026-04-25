@@ -18,6 +18,7 @@ Jive is a small teaching language designed by **Professor Lothar Narins** for CS
 - [x] Stage 4 — local variables (`let` / `set`) + symbol table
 - [x] Stage 5 — function calls, arguments, and parameters
 - [x] Stage 6 — boolean expressions, `if` / `else` / `while`
+- [x] Stage 7 — strings, printing, dynamic memory (`alloc`), array indexing
 
 ## The Jive language
 
@@ -96,6 +97,39 @@ fn main() -> int
 }
 ```
 
+Hello World using the built-in `print` / `print_int` / `print_nl` runtime:
+
+```jive
+fn main() -> int
+{
+    call print("The answer is ")
+    call print_int(42)
+    call print_nl()
+    call print("What is the question?")
+    call print_nl()
+    return 0
+}
+```
+
+prints
+
+```
+The answer is 42
+What is the question?
+```
+
+Heap-allocated arrays via the built-in `alloc(item_count) -> [any]`:
+
+```jive
+fn main() -> int
+{
+    let array: [int] = alloc(2)
+    set array[0] = 23
+    set array[1] = 19
+    return array[0] + array[1]   // exits with 42
+}
+```
+
 Recursive Fibonacci with conditionals and a loop (compiles and runs today — exits with code 88):
 
 ```jive
@@ -116,6 +150,22 @@ fn main() -> int
     }
     return result   // 0+1+1+2+3+5+8+13+21+34 = 88
 }
+```
+
+Conway's Game of Life ([jive_programs/gol.jive](jive_programs/gol.jive)) exercises pretty much every feature stage by stage — `[bool]` arrays from `alloc`, indexed reads and writes, nested `while`s, `if`/`else`, recursion through `count_neighbors`, and `print` / `print_int` / `print_nl` for the rendering. The reference 8×8 glider iterates 12 times and prints frames like:
+
+```
+Iteration: 0           Iteration: 1
++----------------+     +----------------+
+|                |     |                |
+|    []          |     |                |
+|      []        |     |  []  []        |
+|  [][][]        |     |    [][]        |
+|                |     |    []          |
+|                |     |                |
+|                |     |                |
+|                |     |                |
++----------------+     +----------------+
 ```
 
 A loop with side-effectful calls (assuming built-ins `print_int` and `print_nl`):
@@ -313,7 +363,7 @@ build/            compiled binaries and .asm output (git-ignored)
 
 ## How the compiler works
 
-`jive` is a four-stage pipeline: each stage turns the previous stage's output into something closer to machine code.
+`jive` is a chain of passes that gradually rewrites the program into something closer to machine code. The lexer turns text into tokens, the parser builds an AST from those tokens, the IR generator lowers the AST into a flat stack-machine program (consulting a per-function symbol table along the way), and the code generator emits NASM. A small handwritten runtime — `print`, `print_int`, `print_nl`, `alloc` — is prepended to the output, and any string literals encountered are emitted to a `.data` section at the end.
 
 ```mermaid
 flowchart LR
@@ -322,11 +372,11 @@ flowchart LR
     tokens --> parser[parser]
     parser --> ast["AST<br/>(tree)"]
     ast --> ir[ir.c]
-    ir --> irprog["IR<br/>(stack ops)"]
+    ir --> irprog["IR<br/>(stack ops + strings)"]
     irprog --> codegen[codegen]
-    codegen --> asm["out.asm<br/>(NASM)"]
+    codegen --> asm["out.asm<br/>(NASM + runtime + .data)"]
 
-    ir <-->|declare / lookup| symtab[("symbol table<br/>per-function locals")]
+    ir <-->|declare / lookup| symtab[("symbol table<br/>per-function locals + params")]
 ```
 
 **Lexer** ([code/lexer.c](code/lexer.c)). Scans the source character by character and groups characters into tokens — keywords, identifiers, numbers, strings, punctuation. Whitespace and `//` comments are dropped. Each token carries its `file:line:col` location so later stages can report errors that point back to the source.
@@ -344,9 +394,9 @@ program
       integer 42
 ```
 
-**Symbol table** ([code/symbol_table.c](code/symbol_table.c)). A small chained hash table — each bucket is a singly linked list of `Symbol` nodes, and each node holds a `Symbol_Data` payload (slot index, kind, type, declaration location). The split exists so `lookup_symbol` can hand the IR builder a stable pointer to the symbol's metadata without copying. Each function gets its own table, so names don't leak between functions. Two higher-level helpers `declare_local` and `declare_param` assign slots: locals get sequential indices that map to negative rbp offsets (`[rbp-8]`, `[rbp-16]`, …), parameters get their positional index that maps to positive offsets above the saved rbp + return address (first-declared param sits deepest, last-declared sits at `[rbp+16]`). `symbol_frame_offset` does the slot → signed-byte translation. The table starts at 16 buckets and doubles via `grow_table` once `entry_count` would exceed the bucket count, so chains stay short. Trying to insert a name that's already present returns `false`, which is how the IR generator reports `let a: int = 3 / let a: int = 5` (or `fn f(x: int, x: int)`) as a redeclaration.
+**Symbol table** ([code/symbol_table.c](code/symbol_table.c)). A small chained hash table — each bucket is a singly linked list of `Symbol` nodes, and each node holds a `Symbol_Data` payload (slot index, kind, type — basic type plus indirection count, declaration location). The split exists so `lookup_symbol` can hand the IR builder a stable pointer to the symbol's metadata without copying. Each function gets its own table, so names don't leak between functions. Two higher-level helpers `declare_local` and `declare_param` assign slots: locals get sequential indices that map to negative rbp offsets (`[rbp-8]`, `[rbp-16]`, …), parameters get their positional index that maps to positive offsets above the saved rbp + return address (first-declared param sits deepest, last-declared sits at `[rbp+16]`). `symbol_frame_offset` does the slot → signed-byte translation. The table starts at 16 buckets and doubles via `grow_table` once `entry_count` would exceed the bucket count, so chains stay short. Trying to insert a name that's already present returns `false`, which is how the IR generator reports `let a: int = 3 / let a: int = 5` (or `fn f(x: int, x: int)`) as a redeclaration.
 
-**IR generator** ([code/ir.c](code/ir.c)). Lowers each function's AST into a flat sequence of stack-machine instructions: `FN`, `END_FN`, `PUSH <n>`, `LOAD_LOCAL [rbp+off]`, `STORE_LOCAL [rbp+off]`, arithmetic (`ADD`/`SUB`/`MUL`/`DIV`/`MOD`), comparisons (`EQ`/`NEQ`/`LT`/`LE`/`GT`/`GE`), logical `AND`/`OR`, control flow (`LABEL <id>`, `JMP <id>`, `JMP_IF_FALSE <id>`), `CALL <name> (args=N)`, `DROP`, `RETURN`. Expressions are emitted in post-order, so operands are pushed before the op that consumes them. While lowering a function, the IR generator drives a fresh symbol table — parameters are declared up front (so the body can read them), then `let` calls `declare_local` and emits a `STORE_LOCAL` for any initializer, `set` calls `lookup_symbol` and emits a `STORE_LOCAL`, and bare identifiers in expressions become `LOAD_LOCAL` against the bound symbol's frame offset (`symbol_frame_offset` returns negative for locals, positive for params — same op either way). Function calls are lowered argument-by-argument with the same expression machinery and a single `CALL` op that knows how many arguments to clean up; the `call` statement is just a `CALL` followed by `DROP` to throw away the return value. `if` / `else` / `while` are lowered to `JMP_IF_FALSE` and `JMP` against fresh `LABEL`s — `if cond then` becomes `<cond>; JMP_IF_FALSE end; <then>; LABEL end`, while `while cond body` becomes `LABEL top; <cond>; JMP_IF_FALSE end; <body>; JMP top; LABEL end`. Label IDs come from a monotonic counter on the IR builder so they never collide. Names that resolve to nothing (or that are declared twice) become `file:line:col: error: 'a' has not been declared` style diagnostics — the same shape the parser uses, and the driver bails out before codegen if any of them fired. For example, `return 2 + 3 * 4 - 5` becomes:
+**IR generator** ([code/ir.c](code/ir.c)). Lowers each function's AST into a flat sequence of stack-machine instructions: `FN`, `END_FN`, `PUSH <n>`, `PUSH_STR __str_<id>`, `LOAD_LOCAL [rbp+off]`, `STORE_LOCAL [rbp+off]`, `LOAD_INDEX`, `STORE_INDEX`, arithmetic (`ADD`/`SUB`/`MUL`/`DIV`/`MOD`), comparisons (`EQ`/`NEQ`/`LT`/`LE`/`GT`/`GE`), logical `AND`/`OR`, control flow (`LABEL <id>`, `JMP <id>`, `JMP_IF_FALSE <id>`), `CALL <name> (args=N)`, `DROP`, `RETURN`. String literals get interned in a program-wide table on `IR_Program`; `PUSH_STR` carries the table index. Expressions are emitted in post-order, so operands are pushed before the op that consumes them. While lowering a function, the IR generator drives a fresh symbol table — parameters are declared up front (so the body can read them), then `let` calls `declare_local` and emits a `STORE_LOCAL` for any initializer, `set` calls `lookup_symbol` and emits a `STORE_LOCAL`, and bare identifiers in expressions become `LOAD_LOCAL` against the bound symbol's frame offset (`symbol_frame_offset` returns negative for locals, positive for params — same op either way). Function calls are lowered argument-by-argument with the same expression machinery and a single `CALL` op that knows how many arguments to clean up; the `call` statement is just a `CALL` followed by `DROP` to throw away the return value. `if` / `else` / `while` are lowered to `JMP_IF_FALSE` and `JMP` against fresh `LABEL`s — `if cond then` becomes `<cond>; JMP_IF_FALSE end; <then>; LABEL end`, while `while cond body` becomes `LABEL top; <cond>; JMP_IF_FALSE end; <body>; JMP top; LABEL end`. Label IDs come from a monotonic counter on the IR builder so they never collide. Names that resolve to nothing (or that are declared twice) become `file:line:col: error: 'a' has not been declared` style diagnostics — the same shape the parser uses, and the driver bails out before codegen if any of them fired. For example, `return 2 + 3 * 4 - 5` becomes:
 
 ```
 $ ./build/jive jive_programs/expr.jive --dump-ir -o /dev/null
@@ -439,7 +489,7 @@ END_FN
 
 This level decouples "what to compute" from "how to emit machine code" — the IR is small, easy to read with `--dump-ir`, and pleasant to debug.
 
-**Code generator** ([code/codegen.c](code/codegen.c)). Walks the IR linearly and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then translates each IR op directly: `PUSH n` becomes `push n`, binary ops pop right-hand-side into `rcx` and left-hand-side into `rax`, compute, and re-push. `DIV` / `MOD` use `cqo` + `idiv` for signed 64-bit division. Comparisons emit `cmp rax, rcx; setCC al; movzx rax, al; push rax` so the result is always 0 or 1. Logical `AND` / `OR` first normalize each operand to 0/1 via `cmp ..., 0; setne; movzx`, then bitwise-combine — so `2 && 1` correctly yields 1. `IR_LABEL <id>` becomes `.L<id>:` (NASM scopes dot-prefixed labels to the most recent non-local label, i.e. the function), `IR_JMP <id>` becomes `jmp .L<id>`, and `IR_JMP_IF_FALSE <id>` pops the condition off the operand stack and `jz`s to the label. `IR_FN` opens a function with a standard `push rbp / mov rbp, rsp / sub rsp, 8*n_locals` prologue; `LOAD_LOCAL` becomes `push qword [rbp+off]` and `STORE_LOCAL` becomes `pop qword [rbp+off]`, where `off` is the signed offset the IR carries (negative for locals, positive for parameters — codegen does no arithmetic). `IR_CALL` emits `call name`, then `add rsp, 8*n_args` to drop the arguments the caller pushed, then `push rax` so the callee's return value becomes the new top operand. `IR_DROP` is a single `add rsp, 8` and pairs with `CALL` to implement `call` statements that ignore the return value. `IR_RETURN` pops the result into `rax`, then `mov rsp, rbp / pop rbp / ret` tears the frame back down — even if the operand stack still holds residue.
+**Code generator** ([code/codegen.c](code/codegen.c)). Walks the IR linearly and emits NASM. It starts with a fixed `_start` preamble that calls `main` and exits with its return value, then drops in a runtime block defining four built-in functions — `print`, `print_int`, `print_nl`, `alloc` — written by hand in NASM and following the same calling convention as user code (`print` reads a length-prefixed string, `print_int` converts to decimal in a stack buffer, `alloc` calls `mmap`). User functions follow. Each IR op translates directly: `PUSH n` becomes `push n`; `PUSH_STR id` becomes `mov rax, __str_id; push rax`. Binary ops pop RHS into `rcx` and LHS into `rax`, compute, and re-push; `DIV` / `MOD` use `cqo` + `idiv` for signed 64-bit division. Comparisons emit `cmp rax, rcx; setCC al; movzx rax, al; push rax` so the result is always 0 or 1. Logical `AND` / `OR` first normalize each operand to 0/1 via `cmp ..., 0; setne; movzx`, then bitwise-combine — so `2 && 1` correctly yields 1. `IR_LABEL <id>` becomes `.L<id>:` (NASM scopes dot-prefixed labels to the most recent non-local label, i.e. the function), `IR_JMP <id>` becomes `jmp .L<id>`, and `IR_JMP_IF_FALSE <id>` pops the condition off the operand stack and `jz`s to the label. `IR_FN` opens a function with a standard `push rbp / mov rbp, rsp / sub rsp, 8*n_locals` prologue; `LOAD_LOCAL` becomes `push qword [rbp+off]` and `STORE_LOCAL` becomes `pop qword [rbp+off]`, where `off` is the signed offset the IR carries (negative for locals, positive for parameters — codegen does no arithmetic). Indexing assumes 8-byte slots: `LOAD_INDEX` is `pop rcx; pop rax; push qword [rax+rcx*8]`, and `STORE_INDEX` is `pop rcx; pop rax; pop rdx; mov [rax+rcx*8], rdx`. `IR_CALL` emits `call name`, then `add rsp, 8*n_args` to drop the arguments the caller pushed, then `push rax` so the callee's return value becomes the new top operand. `IR_DROP` is a single `add rsp, 8` and pairs with `CALL` to implement `call` statements that ignore the return value. `IR_RETURN` pops the result into `rax`, then `mov rsp, rbp / pop rbp / ret` tears the frame back down — even if the operand stack still holds residue. `IR_END_FN` emits a defensive epilogue (`xor rax, rax; mov rsp, rbp; pop rbp; ret`) so a void function whose body never reaches `return` doesn't fall through into the next function. After every IR op is translated, codegen walks the program's interned string table and emits each literal to a `.data` section as `dq <length>` followed by `db <decoded bytes>`.
 
 The output for `fn main() -> int { return 42 }` is:
 

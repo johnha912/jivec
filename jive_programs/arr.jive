@@ -1,0 +1,7 @@
+fn main() -> int
+{
+    let array: [int] = alloc(2)
+    set array[0] = 23
+    set array[1] = 19
+    return array[0] + array[1]   // Should return 42
+}

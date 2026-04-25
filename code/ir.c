@@ -24,8 +24,11 @@ typedef enum IR_Op_Kind
     IR_FN,
     IR_END_FN,
     IR_PUSH,
+    IR_PUSH_STR,
     IR_LOAD_LOCAL,
     IR_STORE_LOCAL,
+    IR_LOAD_INDEX,
+    IR_STORE_INDEX,
     IR_ADD,
     IR_SUB,
     IR_MUL,
@@ -54,6 +57,7 @@ typedef struct IR_Op
         long push_value;
         long frame_offset;       // for IR_LOAD_LOCAL / IR_STORE_LOCAL
         long label_id;           // for IR_LABEL / IR_JMP / IR_JMP_IF_FALSE
+        long string_id;          // for IR_PUSH_STR; index into IR_Program.strings
         struct {
             String name;
             long   n_locals;     // valid only on IR_FN; backpatched after the body
@@ -65,11 +69,19 @@ typedef struct IR_Op
     };
 } IR_Op;
 
+typedef struct IR_String_Table
+{
+    String *items;
+    long    count;
+    long    capacity;
+} IR_String_Table;
+
 typedef struct IR_Program
 {
-    IR_Op *items;
-    long   count;
-    long   capacity;
+    IR_Op           *items;
+    long             count;
+    long             capacity;
+    IR_String_Table  strings;     // every string literal encountered, in order
 } IR_Program;
 
 typedef struct IR_Result
@@ -92,8 +104,11 @@ static const char *ir_op_kind_name(IR_Op_Kind kind)
         case IR_FN:           return "FN";
         case IR_END_FN:       return "END_FN";
         case IR_PUSH:         return "PUSH";
+        case IR_PUSH_STR:     return "PUSH_STR";
         case IR_LOAD_LOCAL:   return "LOAD_LOCAL";
         case IR_STORE_LOCAL:  return "STORE_LOCAL";
+        case IR_LOAD_INDEX:   return "LOAD_INDEX";
+        case IR_STORE_INDEX:  return "STORE_INDEX";
         case IR_ADD:          return "ADD";
         case IR_SUB:          return "SUB";
         case IR_MUL:          return "MUL";
@@ -127,6 +142,23 @@ static void ir_program_append(IR_Program *prog, IR_Op op)
         prog->capacity = new_cap;
     }
     prog->items[prog->count++] = op;
+}
+
+// Record a string literal and return its (zero-based) index in the table.
+// Currently we don't deduplicate identical literals — codegen emits each one
+// to .data with its own __str_<id> label.
+static long ir_intern_string(IR_Program *prog, String src)
+{
+    if (prog->strings.count >= prog->strings.capacity) {
+        long new_cap = prog->strings.capacity == 0 ? 8 : prog->strings.capacity * 2;
+        String *new_items = (String *)realloc(prog->strings.items,
+                                              (size_t)new_cap * sizeof(String));
+        if (!new_items) { fprintf(stderr, "ir: out of memory\n"); exit(1); }
+        prog->strings.items = new_items;
+        prog->strings.capacity = new_cap;
+    }
+    prog->strings.items[prog->strings.count] = src;
+    return prog->strings.count++;
 }
 
 static void ir_report_error(IR_Builder *builder, Loc loc, const char *msg)
@@ -171,10 +203,31 @@ static void emit_call_args(IR_Builder *builder, AST_List args)
 static void emit_expression(IR_Builder *builder, AST_Node *expr)
 {
     switch (expr->kind) {
-        case AST_INTEGER: {
+        case AST_INTEGER:
+        case AST_BOOL: {
+            // Booleans share storage with integers (1 = true, 0 = false).
             IR_Op op = {0};
             op.kind = IR_PUSH;
             op.push_value = expr->int_value;
+            ir_program_append(builder->prog, op);
+        } break;
+
+        case AST_STRING: {
+            IR_Op op = {0};
+            op.kind = IR_PUSH_STR;
+            op.string_id = ir_intern_string(builder->prog, expr->string_value);
+            ir_program_append(builder->prog, op);
+        } break;
+
+        case AST_INDEX: {
+            // Evaluate array first, then index, then run the load. Each
+            // additional `[…]` walks one more level of indirection.
+            emit_expression(builder, expr->index.array);
+            if (builder->has_error) return;
+            emit_expression(builder, expr->index.index);
+            if (builder->has_error) return;
+            IR_Op op = {0};
+            op.kind = IR_LOAD_INDEX;
             ir_program_append(builder->prog, op);
         } break;
 
@@ -256,12 +309,39 @@ static void emit_statement(IR_Builder *builder, AST_Node *stmt)
                 ir_report_error(builder, stmt->loc, msg);
                 return;
             }
-            emit_expression(builder, stmt->set.value);
-            if (builder->has_error) return;
-            IR_Op op = {0};
-            op.kind = IR_STORE_LOCAL;
-            op.frame_offset = symbol_frame_offset(builder->symbols, sym);
-            ir_program_append(builder->prog, op);
+
+            if (stmt->set.indices.count == 0) {
+                // Plain `set name = expr` — eval RHS, pop into the slot.
+                emit_expression(builder, stmt->set.value);
+                if (builder->has_error) return;
+                IR_Op op = {0};
+                op.kind = IR_STORE_LOCAL;
+                op.frame_offset = symbol_frame_offset(builder->symbols, sym);
+                ir_program_append(builder->prog, op);
+            } else {
+                // `set name[i][j]…[k] = expr` — push value first so it sits
+                // beneath the (eventually computed) array pointer + final
+                // index, then walk the indexing chain. Every `[…]` except
+                // the last is a LOAD_INDEX (peel one indirection); the last
+                // one becomes a STORE_INDEX that pops index, array, value.
+                emit_expression(builder, stmt->set.value);
+                if (builder->has_error) return;
+
+                IR_Op load_base = {0};
+                load_base.kind = IR_LOAD_LOCAL;
+                load_base.frame_offset = symbol_frame_offset(builder->symbols, sym);
+                ir_program_append(builder->prog, load_base);
+
+                long n = stmt->set.indices.count;
+                long i = 0;
+                for (AST_Node *idx = stmt->set.indices.first; idx != NULL; idx = idx->next, i++) {
+                    emit_expression(builder, idx);
+                    if (builder->has_error) return;
+                    IR_Op op = {0};
+                    op.kind = (i + 1 == n) ? IR_STORE_INDEX : IR_LOAD_INDEX;
+                    ir_program_append(builder->prog, op);
+                }
+            }
         } break;
 
         case AST_CALL_STMT: {
@@ -459,9 +539,13 @@ IR_Result ir_from_ast(AST_Node *ast)
 void ir_program_free(IR_Program *prog)
 {
     free(prog->items);
+    free(prog->strings.items);
     prog->items = NULL;
+    prog->strings.items = NULL;
     prog->count = 0;
     prog->capacity = 0;
+    prog->strings.count = 0;
+    prog->strings.capacity = 0;
 }
 
 void print_ir(const IR_Program *prog)
@@ -478,6 +562,9 @@ void print_ir(const IR_Program *prog)
                 break;
             case IR_PUSH:
                 printf("PUSH %ld\n", op->push_value);
+                break;
+            case IR_PUSH_STR:
+                printf("PUSH_STR __str_%ld\n", op->string_id);
                 break;
             case IR_LOAD_LOCAL:
                 printf("LOAD_LOCAL [rbp%+ld]\n", op->frame_offset);

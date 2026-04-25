@@ -80,6 +80,40 @@ run_and_check_exit() {
 run_and_check_exit vars.jive 42
 run_and_check_exit fn_calls.jive 25
 run_and_check_exit fib.jive 88
+run_and_check_exit arr.jive 42
+run_and_check_exit hello.jive 0
+run_and_check_exit gol.jive 0
+
+# Stage 7 spot-check: hello.jive should print exactly the expected lines.
+# `$()` strips trailing newlines, so compare with one too.
+echo === HELLO.JIVE OUTPUT CHECK ===
+expected_hello=$'The answer is 42\nWhat is the question?'
+actual_hello=$(./hello)
+if [ "$actual_hello" != "$expected_hello" ]; then
+	echo "ERROR: hello output mismatch"
+	exit 1
+fi
+echo "hello output matches expected text"
+
+# Stage 7 spot-check: gol's iteration 0 should match the spec's reference grid.
+echo === GOL.JIVE ITERATION 0 CHECK ===
+expected_iter0='Iteration: 0
++----------------+
+|                |
+|    []          |
+|      []        |
+|  [][][]        |
+|                |
+|                |
+|                |
+|                |
++----------------+'
+actual_iter0=$(./gol | head -11)
+if [ "$actual_iter0" != "$expected_iter0" ]; then
+	echo "ERROR: gol iteration 0 mismatch"
+	exit 1
+fi
+echo "gol iteration 0 matches spec"
 
 echo === ERROR-CASE TESTS ===
 

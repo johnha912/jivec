@@ -95,11 +95,11 @@ static const Keyword_Entry KEYWORDS[] = {
 };
 static const size_t N_KEYWORDS = sizeof(KEYWORDS) / sizeof(KEYWORDS[0]);
 
-typedef struct { const char *name; Type type; } Type_Entry;
+typedef struct { const char *name; Basic_Type type; } Type_Entry;
 static const Type_Entry TYPES[] = {
-    {"int",  TYPE_INT},
-    {"str",  TYPE_STR},
-    {"bool", TYPE_BOOL},
+    {"int",  BTYPE_INT},
+    {"str",  BTYPE_STR},
+    {"bool", BTYPE_BOOL},
 };
 static const size_t N_TYPES = sizeof(TYPES) / sizeof(TYPES[0]);
 
@@ -157,7 +157,7 @@ static Token next_token(Lexer *lex)
         for (size_t i = 0; i < N_TYPES; i++) {
             if (string_equals_cstr(src, TYPES[i].name)) {
                 Token t = make_token(TOKEN_TYPE, start_loc, src);
-                t.type = TYPES[i].type;
+                t.basic_type = TYPES[i].type;
                 return t;
             }
         }

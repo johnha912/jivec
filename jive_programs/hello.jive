@@ -1,0 +1,9 @@
+fn main() -> int
+{
+    call print("The answer is ")
+    call print_int(42)
+    call print_nl()
+    call print("What is the question?")
+    call print_nl()
+    return 0
+}

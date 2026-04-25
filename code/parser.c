@@ -6,14 +6,38 @@
 
 // PRINT_STRING is defined in string.c (unity build).
 
-static const char *type_name_cstr(Type t)
+static const char *basic_type_name(Basic_Type t)
 {
     switch (t) {
-        case TYPE_INT:  return "int";
-        case TYPE_STR:  return "str";
-        case TYPE_BOOL: return "bool";
+        case BTYPE_INT:  return "int";
+        case BTYPE_STR:  return "str";
+        case BTYPE_BOOL: return "bool";
+        case BTYPE_ANY:  return "any";
     }
     return "?";
+}
+
+// Render a Type as `int`, `[bool]`, `[[str]]`, etc. into a static buffer.
+// The buffer rotates between calls, so up to four pending uses are safe —
+// good enough for printing a parameter list.
+static const char *type_to_cstr(Type t)
+{
+    static char  bufs[4][64];
+    static int   next = 0;
+    char *buf = bufs[next];
+    next = (next + 1) & 3;
+
+    int pos = 0;
+    for (int i = 0; i < t.indirection && pos + 1 < (int)sizeof(bufs[0]); i++) {
+        buf[pos++] = '[';
+    }
+    const char *name = basic_type_name(t.basic);
+    while (*name && pos + 1 < (int)sizeof(bufs[0])) buf[pos++] = *name++;
+    for (int i = 0; i < t.indirection && pos + 1 < (int)sizeof(bufs[0]); i++) {
+        buf[pos++] = ']';
+    }
+    buf[pos] = '\0';
+    return buf;
 }
 
 static const char *keyword_name_cstr(Keyword kw)
@@ -46,10 +70,13 @@ typedef enum AST_Kind
     AST_WHILE,
     AST_BLOCK,
     AST_INTEGER,
+    AST_BOOL,         // `true` / `false` literal — stored as 1 / 0 in int_value
+    AST_STRING,       // string literal — stores the raw source bytes between the quotes
     AST_IDENT,
     AST_BINOP,
     AST_CALL,         // function call used as an expression (return value kept)
     AST_CALL_STMT,    // `call` statement (return value discarded)
+    AST_INDEX,        // array indexing: `arr[expr]`
 } AST_Kind;
 
 static const char *ast_kind_name(AST_Kind kind)
@@ -66,10 +93,13 @@ static const char *ast_kind_name(AST_Kind kind)
         case AST_WHILE:     return "WHILE";
         case AST_BLOCK:     return "BLOCK";
         case AST_INTEGER:   return "INTEGER";
+        case AST_BOOL:      return "BOOL";
+        case AST_STRING:    return "STRING";
         case AST_IDENT:     return "IDENT";
         case AST_BINOP:     return "BINOP";
         case AST_CALL:      return "CALL";
         case AST_CALL_STMT: return "CALL_STMT";
+        case AST_INDEX:     return "INDEX";
     }
     return "?";
 }
@@ -146,8 +176,15 @@ typedef struct AST_Let_Data
 typedef struct AST_Set_Data
 {
     String    name;
+    AST_List  indices;   // empty for plain `set name = …`; otherwise one expr per `[…]`
     AST_Node *value;
 } AST_Set_Data;
+
+typedef struct AST_Index_Data
+{
+    AST_Node *array;
+    AST_Node *index;
+} AST_Index_Data;
 
 typedef struct AST_Param_Data
 {
@@ -186,14 +223,16 @@ struct AST_Node
         AST_Fn_Data    fn;
         AST_Param_Data param;
         AST_Node      *ret_expr;
-        long           int_value;
+        long           int_value;       // also used for AST_BOOL: 0 (false) or 1 (true)
         String         ident_name;
+        String         string_value;    // raw source bytes between the quotes (escapes still encoded)
         AST_Binop_Data binop;
         AST_Let_Data   let;
         AST_Set_Data   set;
         AST_Call_Data  call;
         AST_If_Data    if_stmt;
         AST_While_Data while_stmt;
+        AST_Index_Data index;
     };
 };
 
@@ -300,46 +339,73 @@ static void parse_argument_list(Parser *parser, AST_List *args)
 static AST_Node *parse_primary(Parser *parser)
 {
     Token *tok = peek_token(parser, 0);
+    AST_Node *node = NULL;
+
     if (tok->kind == TOKEN_INTEGER) {
-        AST_Node *node = make_ast_node(AST_INTEGER);
+        node = make_ast_node(AST_INTEGER);
         node->loc = tok->loc;
         node->int_value = tok->long_value;
         parser->tok_index++;
-        return node;
-    }
-    if (tok->kind == TOKEN_IDENT) {
+    } else if (tok->kind == TOKEN_STRING) {
+        node = make_ast_node(AST_STRING);
+        node->loc = tok->loc;
+        node->string_value = tok->source;
+        parser->tok_index++;
+    } else if (tok->kind == TOKEN_KEYWORD &&
+               (tok->keyword == KEYWORD_TRUE || tok->keyword == KEYWORD_FALSE)) {
+        node = make_ast_node(AST_BOOL);
+        node->loc = tok->loc;
+        node->int_value = (tok->keyword == KEYWORD_TRUE) ? 1 : 0;
+        parser->tok_index++;
+    } else if (tok->kind == TOKEN_IDENT) {
         Token *next = peek_token(parser, 1);
         if (next->kind == TOKEN_OPEN_PAREN) {
             // Call expression: ident '(' [ args ] ')'
-            AST_Node *node = make_ast_node(AST_CALL);
+            node = make_ast_node(AST_CALL);
             node->loc = tok->loc;
             node->call.name = tok->source;
             parser->tok_index += 2; // consume name and '('
             parse_argument_list(parser, &node->call.args);
             if (parser->has_error) return node;
             expect_token(parser, TOKEN_CLOSE_PAREN);
-            return node;
+            if (parser->has_error) return node;
+        } else {
+            node = make_ast_node(AST_IDENT);
+            node->loc = tok->loc;
+            node->ident_name = tok->source;
+            parser->tok_index++;
         }
-        AST_Node *node = make_ast_node(AST_IDENT);
-        node->loc = tok->loc;
-        node->ident_name = tok->source;
+    } else if (tok->kind == TOKEN_OPEN_PAREN) {
         parser->tok_index++;
-        return node;
-    }
-    if (tok->kind == TOKEN_OPEN_PAREN) {
-        parser->tok_index++;
-        AST_Node *inner = parse_expression(parser);
-        if (parser->has_error) return inner;
+        node = parse_expression(parser);
+        if (parser->has_error) return node;
         Token *close = peek_token(parser, 0);
         if (close->kind != TOKEN_CLOSE_PAREN) {
             report_error_at(parser, close->loc, "expected ')' to close parenthesized expression");
-            return inner;
+            return node;
         }
         parser->tok_index++;
-        return inner;
+    } else {
+        report_error_at(parser, tok->loc, "expected an expression");
+        return NULL;
     }
-    report_error_at(parser, tok->loc, "expected an expression");
-    return NULL;
+
+    // Postfix indexing: any number of `[expr]` after the primary builds a
+    // left-associated chain. `arr[i][j]` parses as `INDEX(INDEX(arr, i), j)`.
+    while (peek_token(parser, 0)->kind == TOKEN_OPEN_BRACKET) {
+        Token *bracket = peek_token(parser, 0);
+        parser->tok_index++;
+        AST_Node *idx = parse_expression(parser);
+        if (parser->has_error) return node;
+        expect_token(parser, TOKEN_CLOSE_BRACKET);
+        if (parser->has_error) return node;
+        AST_Node *index_node = make_ast_node(AST_INDEX);
+        index_node->loc = bracket->loc;
+        index_node->index.array = node;
+        index_node->index.index = idx;
+        node = index_node;
+    }
+    return node;
 }
 
 static AST_Node *parse_multiplicative(Parser *parser)
@@ -470,6 +536,29 @@ static AST_Node *parse_expression(Parser *parser)
     return parse_logical_or(parser);
 }
 
+// Parse a Jive type annotation: `int`, `[bool]`, `[[str]]`, etc. Each
+// pair of brackets bumps the indirection count; the innermost token must
+// be a basic type (TOKEN_TYPE).
+static Type parse_type(Parser *parser)
+{
+    Type result = {0};
+    int indirection = 0;
+    while (peek_token(parser, 0)->kind == TOKEN_OPEN_BRACKET) {
+        parser->tok_index++;
+        indirection++;
+    }
+    Token *basic_tok = expect_token(parser, TOKEN_TYPE);
+    if (parser->has_error) return result;
+    result.basic = basic_tok->basic_type;
+    for (int i = 0; i < indirection; i++) {
+        Token *close = expect_token(parser, TOKEN_CLOSE_BRACKET);
+        (void)close;
+        if (parser->has_error) return result;
+    }
+    result.indirection = indirection;
+    return result;
+}
+
 static AST_Node *parse_let_statement(Parser *parser)
 {
     AST_Node *node = make_ast_node(AST_LET);
@@ -484,9 +573,8 @@ static AST_Node *parse_let_statement(Parser *parser)
     expect_token(parser, TOKEN_COLON);
     if (parser->has_error) return node;
 
-    Token *type_tok = expect_token(parser, TOKEN_TYPE);
+    node->let.type = parse_type(parser);
     if (parser->has_error) return node;
-    node->let.type = type_tok->type;
 
     Token *maybe_eq = peek_token(parser, 0);
     if (maybe_eq->kind == TOKEN_EQ) {
@@ -508,6 +596,17 @@ static AST_Node *parse_set_statement(Parser *parser)
     Token *name = expect_token(parser, TOKEN_IDENT);
     if (parser->has_error) return node;
     node->set.name = name->source;
+
+    // Optional indexing chain on the left: `set arr[i][j] = expr` becomes
+    // a SET with two index expressions plus the RHS value.
+    while (peek_token(parser, 0)->kind == TOKEN_OPEN_BRACKET) {
+        parser->tok_index++;
+        AST_Node *idx = parse_expression(parser);
+        if (parser->has_error) return node;
+        expect_token(parser, TOKEN_CLOSE_BRACKET);
+        if (parser->has_error) return node;
+        ast_list_append(&node->set.indices, idx);
+    }
 
     expect_token(parser, TOKEN_EQ);
     if (parser->has_error) return node;
@@ -674,9 +773,8 @@ static AST_Node *parse_fn_def(Parser *parser)
             expect_token(parser, TOKEN_COLON);
             if (parser->has_error) return result;
 
-            Token *param_type = expect_token(parser, TOKEN_TYPE);
+            param->param.type = parse_type(parser);
             if (parser->has_error) return result;
-            param->param.type = param_type->type;
 
             ast_list_append(&result->fn.parameters, param);
 
@@ -691,10 +789,9 @@ static AST_Node *parse_fn_def(Parser *parser)
     Token *maybe_arrow = peek_token(parser, 0);
     if (maybe_arrow->kind == TOKEN_ARROW) {
         parser->tok_index++;
-        Token *ret_type_tok = expect_token(parser, TOKEN_TYPE);
+        result->fn.return_type = parse_type(parser);
         if (parser->has_error) return result;
         result->fn.has_return_type = true;
-        result->fn.return_type = ret_type_tok->type;
     }
 
     result->fn.body = parse_block(parser);
@@ -748,11 +845,11 @@ static void print_ast_with_indent(AST_Node *node, int depth)
                 if (!first) printf(", ");
                 first = 0;
                 printf("%.*s: %s",
-                       PRINT_STRING(p->param.name), type_name_cstr(p->param.type));
+                       PRINT_STRING(p->param.name), type_to_cstr(p->param.type));
             }
             printf(")");
             if (node->fn.has_return_type) {
-                printf(" -> %s", type_name_cstr(node->fn.return_type));
+                printf(" -> %s", type_to_cstr(node->fn.return_type));
             }
             printf("\n");
             for (AST_Node *stmt = node->fn.body.first; stmt != NULL; stmt = stmt->next) {
@@ -762,12 +859,18 @@ static void print_ast_with_indent(AST_Node *node, int depth)
 
         case AST_LET: {
             printf("%*slet %.*s: %s\n", 2 * depth, "",
-                   PRINT_STRING(node->let.name), type_name_cstr(node->let.type));
+                   PRINT_STRING(node->let.name), type_to_cstr(node->let.type));
             if (node->let.init) print_ast_with_indent(node->let.init, depth + 1);
         } break;
 
         case AST_SET: {
-            printf("%*sset %.*s\n", 2 * depth, "", PRINT_STRING(node->set.name));
+            printf("%*sset %.*s", 2 * depth, "", PRINT_STRING(node->set.name));
+            for (long i = 0; i < node->set.indices.count; i++) printf("[]");
+            printf("\n");
+            for (AST_Node *i = node->set.indices.first; i != NULL; i = i->next) {
+                printf("%*sindex\n", 2 * (depth + 1), "");
+                print_ast_with_indent(i, depth + 2);
+            }
             print_ast_with_indent(node->set.value, depth + 1);
         } break;
 
@@ -780,8 +883,22 @@ static void print_ast_with_indent(AST_Node *node, int depth)
             printf("%*sinteger %ld\n", 2 * depth, "", node->int_value);
         } break;
 
+        case AST_BOOL: {
+            printf("%*sbool %s\n", 2 * depth, "", node->int_value ? "true" : "false");
+        } break;
+
+        case AST_STRING: {
+            printf("%*sstring \"%.*s\"\n", 2 * depth, "", PRINT_STRING(node->string_value));
+        } break;
+
         case AST_IDENT: {
             printf("%*sident %.*s\n", 2 * depth, "", PRINT_STRING(node->ident_name));
+        } break;
+
+        case AST_INDEX: {
+            printf("%*sindex\n", 2 * depth, "");
+            print_ast_with_indent(node->index.array, depth + 1);
+            print_ast_with_indent(node->index.index, depth + 1);
         } break;
 
         case AST_BINOP: {
