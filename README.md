@@ -522,6 +522,32 @@ Assemble + link with `nasm -felf64` and `ld`, and the resulting ELF exits with c
 - **`gcc: error: unrecognized command-line option '-Wpedantic'`** — your `gcc` is very old. Install a newer one via `sudo apt install gcc`.
 - **Running on Windows without WSL** — MSYS2/MinGW GCC works but produces `.exe` output and is not the supported path. If you must, add `.exe` to the output name.
 
+## Stage summary
+
+A condensed catalogue of the compiler's incremental stages. Each row describes a self-contained extension that introduces new productions to the surface language and lowers them through every later phase of the pipeline; nothing earlier is replaced once shipped. The *Background concepts* column points readers to the entries in [References](#references) that motivate each stage's design choices.
+
+| #  | Stage                                  | Surface productions added                                                                                              | IR / runtime additions                                                                                                                              | Background concepts                                              | Validation artifact                                          |
+| :- | :------------------------------------- | :--------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------- |
+| 1  | Lexical analysis                       | Identifiers, keywords, basic types, integer + string literals, operator punctuation, `//` line comments                | Hand-written tokenizer with `file:line:col` provenance on every emitted token                                                                       | Tokenization, regular languages [2]                              | `test_lexer` driver                                          |
+| 2  | Syntax & minimal codegen               | `fn name() -> int { return <int> }`                                                                                    | Recursive-descent parser over the EBNF; `AST_PROGRAM` / `AST_FN` / `AST_RETURN` / `AST_INTEGER`; `_start` preamble emitting the `exit` syscall      | Top-down parsing [2, 3]                                          | `simple.jive`                                                |
+| 3  | Arithmetic expressions                 | `+ − ∗ / %` with parenthesised sub-expressions                                                                          | Stack-machine IR (`PUSH`, `ADD`, `SUB`, `MUL`, `DIV`, `MOD`); precedence-climbing parser layer; `cqo` + `idiv` for signed 64-bit division           | Precedence climbing, stack VMs [4]                               | `expr.jive`                                                  |
+| 4  | Local variables & symbol table         | `let name: T [= expr]`, `set name = expr`, identifier references                                                       | Per-function chained hash symbol table; rbp-relative slot model; `LOAD_LOCAL` / `STORE_LOCAL`; redeclaration / undeclared diagnostics               | Symbol tables, chained hashing [2, 3]                            | `vars.jive` (exits 42); `err_*.jive` negative cases          |
+| 5  | Function calls, arguments, parameters  | Parameter lists, call expressions, `call` statement                                                                    | Caller-pushes-args / caller-cleans-up convention; signed `frame_offset` unifies locals (negative) and parameters (positive); `CALL` / `DROP`        | Calling conventions, activation records [5]                      | `fn_calls.jive` (exits 25)                                   |
+| 6  | Boolean expressions & control flow     | `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, <code>&#124;&#124;</code>, `if` / `else`, `while`, statement blocks             | Table-driven precedence layers; `cmp` + `setCC` + `movzx`; logical operators normalise operands to {0, 1}; `LABEL` / `JMP` / `JMP_IF_FALSE`         | Conditional jumps, structured control flow [3]                   | `fib.jive` (exits 88)                                        |
+| 7  | Strings, printing, dynamic memory      | `[T]` array types of arbitrary indirection, string literals, indexed read/write `arr[i]`, `true` / `false`              | `Type` promoted to `{basic, indirection}`; program-wide string-literal table → `.data`; hand-written runtime over `sys_write` (1) and `sys_mmap` (9) | Dynamic memory, x86-64 syscalls, calling conventions [1, 5]      | `hello.jive` (exact text), `arr.jive` (exits 42), `gol.jive` |
+
+## References
+
+[1] S. J. Matthews, T. Newhall, and K. C. Webb. *Dive into Systems*, Version 1.2. Dive into Systems, LLC, 2020. CC BY-NC-ND 4.0. <https://diveintosystems.org>
+
+[2] A. V. Aho, M. S. Lam, R. Sethi, and J. D. Ullman. *Compilers: Principles, Techniques, and Tools* (2nd ed.). Pearson Addison-Wesley, 2006.
+
+[3] K. D. Cooper and L. Torczon. *Engineering a Compiler* (2nd ed.). Morgan Kaufmann, 2011.
+
+[4] R. Nystrom. *Crafting Interpreters*. Genever Benning, 2021. <https://craftinginterpreters.com>
+
+[5] H. J. Lu, M. Matz, J. Hubička, A. Jaeger, and M. Mitchell, eds. *System V Application Binary Interface — AMD64 Architecture Processor Supplement*, Version 1.0, 2018.
+
 ## Credits
 
 The **Jive** language was designed by **Professor Lothar Narins** for CS 5008 at Northeastern University. The language design, grammar, and course structure are his work; this repository is my compiler implementation.
